@@ -1,13 +1,12 @@
 import functools
 import json
 import logging
-import os
+import sys
 import threading
 import time
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 from rich.columns import Columns
 from rich.console import Group
 from rich.layout import Layout
@@ -20,6 +19,7 @@ from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import Button, DataTable, Footer, Header, Static
 
+from config import NODE, PROXMOX_API_URL, missing_settings
 from utils import (
     draw_vertical_bar_chart,
     find_vm_ip_address,
@@ -42,24 +42,6 @@ file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 logging.getLogger().addHandler(file_handler)
-
-# Load environment variables
-load_dotenv()
-
-# Proxmox API configuration
-PROXMOX_API_URL = os.getenv("PROXMOX_HOST")
-API_TOKEN_ID = os.getenv("TOKEN_ID")
-API_TOKEN_SECRET = os.getenv("TOKEN_SECRET")
-NODE = os.getenv("NODE")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-SSH_USER = os.getenv("SSH_USER")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
-
-# Disable warnings for unverified HTTPS requests
-requests.packages.urllib3.disable_warnings(
-    requests.packages.urllib3.exceptions.InsecureRequestWarning
-)
 
 # Number of samples kept for the history charts (one per 2s tick, so 10 minutes;
 # more than a chart is wide, even on a very wide terminal)
@@ -734,5 +716,11 @@ class ProxmonApp(App):
 
 
 if __name__ == "__main__":
+    missing = missing_settings()
+    if missing:
+        sys.exit(
+            f"Missing settings: {', '.join(missing)}\n"
+            "Set them in a .env file (see .env_example) or in the environment."
+        )
     app = ProxmonApp()
     app.run()

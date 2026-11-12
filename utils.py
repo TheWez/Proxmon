@@ -1,5 +1,4 @@
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -10,34 +9,23 @@ from pathlib import Path
 
 import paramiko
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import (
+    API_TIMEOUT,
+    HEADERS,
+    NODE,
+    PROXMOX_API_URL,
+    SSH_HOST,
+    SSH_PASSWORD,
+    SSH_PORT,
+    SSH_USER,
+)
 
-# Proxmox API configuration
-PROXMOX_API_URL = os.getenv("PROXMOX_HOST")
-API_TOKEN_ID = os.getenv("TOKEN_ID")
-API_TOKEN_SECRET = os.getenv("TOKEN_SECRET")
-NODE = os.getenv("NODE")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-SSH_USER = os.getenv("SSH_USER")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
-
-HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
-
-# Seconds to wait for the Proxmox API before giving up (an unreachable host
-# would otherwise hang a refresh indefinitely).
-API_TIMEOUT = 10
-
-# Global variables
-TABLE_CURSOR = dict()
-selected_vm = {
-    "vmid": None,
-    "type": None,
-    "name": None,
-    "status": None,
-}
+# The Proxmox API is usually served with a self-signed certificate, so requests
+# are made unverified: silence the warning that would otherwise spam the log.
+requests.packages.urllib3.disable_warnings(
+    requests.packages.urllib3.exceptions.InsecureRequestWarning
+)
 
 
 _ssh_lock = threading.Lock()
