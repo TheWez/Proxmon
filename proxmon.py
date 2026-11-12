@@ -1,6 +1,8 @@
+import functools
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from rich.console import Group
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Container, VerticalScroll
 from textual.timer import Timer
@@ -97,6 +100,43 @@ def toggle_vm(self):
     return response.json()
 
 
+def coalesced(fn):
+    """Run a refresh method on one thread at a time.
+
+    A call made while a previous one is still running doesn't pile up (or get
+    dropped): it is remembered and the method runs once more as soon as the
+    current run finishes. Slow API responses therefore can't stack up requests
+    or starve the refresh.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        state = self.__dict__.setdefault(
+            f"_coalesce_{fn.__name__}",
+            {"lock": threading.Lock(), "running": False, "pending": False},
+        )
+        with state["lock"]:
+            if state["running"]:
+                state["pending"] = True
+                return
+            state["running"] = True
+        try:
+            while True:
+                fn(self, *args, **kwargs)
+                with state["lock"]:
+                    if not state["pending"]:
+                        state["running"] = False
+                        return
+                    state["pending"] = False
+        except BaseException:
+            with state["lock"]:
+                state["running"] = False
+                state["pending"] = False
+            raise
+
+    return wrapper
+
+
 class ProxmonApp(App):
     CSS_PATH = "styles.tcss"
     BINDINGS = [
@@ -113,6 +153,13 @@ class ProxmonApp(App):
     vm_stats = {}
     gpu_history = {}
 
+    def _ui(self, func, *args):
+        """Run func on the UI thread from a worker thread (no-op if app is closing)."""
+        try:
+            self.call_from_thread(func, *args)
+        except RuntimeError:
+            pass
+
     def compose(self) -> ComposeResult:
         yield Header("Proxmox Monitor")
         yield Container(
@@ -125,11 +172,18 @@ class ProxmonApp(App):
         yield VerticalScroll(Static(id="stats", expand=True))
         yield Footer()
 
+    @work(thread=True)
+    @coalesced
     def update_node_stats(self):
-        """Update and display node statistics."""
+        """Fetch node statistics (worker thread), then display them."""
         temp = get_cpu_temperature()
         url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/status"
         node_data = get_data_from_proxapi(url)
+        gpus = get_gpu_stats()
+        self._ui(self.render_node_stats, temp, node_data, gpus)
+
+    def render_node_stats(self, temp, node_data, gpus):
+        """Display node statistics (UI thread)."""
         free_memory = node_data.get("memory").get("free", 0) / (1024 * 1024 * 1024)
         total_memory = node_data.get("memory").get("total", 0) / (1024 * 1024 * 1024)
         used_memory = round(total_memory - free_memory, 0)
@@ -144,7 +198,7 @@ class ProxmonApp(App):
         disk_total = node_data.get("rootfs").get("total") / (1024 * 1024 * 1024)
         disk_used = node_data.get("rootfs").get("used") / (1024 * 1024 * 1024)
 
-        gpu_summary = format_gpu_summary(get_gpu_stats())
+        gpu_summary = format_gpu_summary(gpus)
         gpu_text = f"｜ {gpu_summary} " if gpu_summary else ""
 
         text = (
@@ -190,13 +244,18 @@ class ProxmonApp(App):
         self.update_gpu_charts()
         self.timer_gpu = self.set_interval(2, self.update_gpu_charts)
 
+    @work(thread=True)
+    @coalesced
     def update_gpu_charts(self):
-        """Update the node-level GPU, VRAM and GTT history charts.
+        """Read the GPUs (worker thread), then update the history charts."""
+        self._ui(self.render_gpu_charts, get_gpu_stats())
+
+    def render_gpu_charts(self, gpus):
+        """Update the node-level GPU, VRAM and GTT history charts (UI thread).
 
         The panel is hidden when no supported GPU is found.
         """
         container = self.query_one("#gpu_charts_vs")
-        gpus = get_gpu_stats()
         container.display = bool(gpus)
         if not gpus:
             return
@@ -279,8 +338,28 @@ class ProxmonApp(App):
             toggle_vm(self)
             self.update_table()
 
+    @work(thread=True)
+    @coalesced
     def update_table(self):
-        """Update the VM and LXC table."""
+        """Fetch the VM and LXC data (worker thread), then show it in the table."""
+        vmids = get_vmids()
+        vm_data = []
+        for vmid in vmids["vm"]:
+            json_data = get_vm_data(vmid, type="vm")
+            json_data["type"] = "VM"
+            vm_data.append(json_data)
+
+        for vmid in vmids["lxc"]:
+            json_data = get_vm_data(vmid, type="lxc")
+            json_data["type"] = "LXC"
+            vm_data.append(json_data)
+
+        vm_data = sorted(vm_data, key=lambda d: d["vmid"])
+        ip_data = find_vm_ip_address()
+        self._ui(self.render_table, vm_data, ip_data)
+
+    def render_table(self, vm_data, ip_data):
+        """Show the VM and LXC data in the table (UI thread)."""
         global TABLE_CURSOR
         table = self.query_one("#vm_table", DataTable)
 
@@ -288,20 +367,6 @@ class ProxmonApp(App):
         selected_row = table.cursor_row
 
         table.clear()
-
-        vm_data = []
-        for vmid in get_vmids()["vm"]:
-            json_data = get_vm_data(vmid, type="vm")
-            json_data["type"] = "VM"
-            vm_data.append(json_data)
-
-        for vmid in get_vmids()["lxc"]:
-            json_data = get_vm_data(vmid, type="lxc")
-            json_data["type"] = "LXC"
-            vm_data.append(json_data)
-
-        vm_data = sorted(vm_data, key=lambda d: d["vmid"])
-        ip_data = find_vm_ip_address()
 
         for idx, data in enumerate(vm_data):
             mem_usage = (
@@ -352,19 +417,26 @@ class ProxmonApp(App):
         TABLE_CURSOR = {"cursor_row": event.cursor_row, "row_key": event.row_key}
         self.update_rrd_data()
 
+    @work(thread=True)
+    @coalesced
     def update_rrd_data(self):
-        """Update RRD data for the selected VM or LXC."""
-        global selected_vm
-        if selected_vm["vmid"] is None:
+        """Fetch stats for the selected VM or LXC (worker thread), then show them."""
+        selected = dict(selected_vm)  # snapshot: the selection can change under us
+        if selected["vmid"] is None:
             return
+        data = get_vm_data(selected["vmid"], selected["type"])
+        config = get_vm_config(selected["vmid"], selected["type"])
+        self._ui(self.render_rrd_data, selected, data, config)
 
-        vmid = selected_vm["vmid"]
-        vm_type = selected_vm["type"]
-        vm_name = selected_vm["name"]
-        # rrd_data = get_rrd_data(vmid=vmid, vm_type=vm_type)
-        # rrd_data = sorted(rrd_data, key=lambda d: d['time'])
+    def render_rrd_data(self, selected, data, config):
+        """Show stats for the selected VM or LXC (UI thread)."""
+        global selected_vm
+        if selected["vmid"] != selected_vm["vmid"]:
+            return  # selection changed while fetching; the next refresh will catch up
 
-        data = get_vm_data(vmid, vm_type)
+        vmid = selected["vmid"]
+        vm_type = selected["type"]
+        vm_name = selected["name"]
         ts = time.time()
         cpu = data.get("cpu", data.get("maxcpu", 0)) * 100
         mem = data.get("mem", data.get("maxmem", 0)) / (1024 * 1024)
@@ -475,14 +547,13 @@ class ProxmonApp(App):
                 Panel("VM/LXC Not Running!", title="Network Out", border_style="blue")
             )
 
-        self.query_one("#stats", Static).update(layout)
-        # layout["misc"].update(Panel(str(get_vm_config(vmid, vm_type)), border_style="blue"))
         layout["misc"].update(
             Panel(
-                json.dumps(get_vm_config(vmid, vm_type), indent=4, sort_keys=True),
+                json.dumps(config, indent=4, sort_keys=True),
                 border_style="magenta",
             )
         )
+        self.query_one("#stats", Static).update(layout)
 
     def stats_layout(self):
         """Define the layout for statistics display."""
