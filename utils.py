@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 import subprocess
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -38,24 +40,59 @@ selected_vm = {
 }
 
 
+_ssh_lock = threading.Lock()
+_ssh_client = None
+_ssh_target = None
+
+
+def _close_ssh():
+    """Drop the cached SSH connection (caller holds _ssh_lock)."""
+    global _ssh_client, _ssh_target
+    if _ssh_client is not None:
+        try:
+            _ssh_client.close()
+        except Exception:
+            pass
+    _ssh_client = _ssh_target = None
+
+
 def ssh_execute_command(host, username, password, command, port=22):
-    """SSH into a Proxmox node and execute a command."""
+    """SSH into a Proxmox node and execute a command.
+
+    The connection is kept open and reused between calls (this runs every few
+    seconds), and is re-established automatically if it has dropped.
+    """
+    global _ssh_client, _ssh_target
     if not host:
         return None
 
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            host, port=port, username=username, password=password, timeout=10
-        )
-        _, stdout, stderr = client.exec_command(command)
-        output = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
-        client.close()
-        return output if output else error
-    except Exception as e:
-        return f"SSH Connection failed: {str(e)}"
+    target = (host, port, username)
+    with _ssh_lock:
+        try:
+            for attempt in (1, 2):
+                transport = _ssh_client.get_transport() if _ssh_client else None
+                if _ssh_target != target or transport is None or not transport.is_active():
+                    _close_ssh()
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(
+                        host, port=port, username=username, password=password, timeout=10
+                    )
+                    _ssh_client, _ssh_target = client, target
+                try:
+                    _, stdout, stderr = _ssh_client.exec_command(command, timeout=10)
+                    output = stdout.read().decode().strip()
+                    error = stderr.read().decode().strip()
+                    return output if output else error
+                except Exception:
+                    # a cached connection can go stale without the transport
+                    # noticing: reconnect once before giving up
+                    _close_ssh()
+                    if attempt == 2:
+                        raise
+        except Exception as e:
+            _close_ssh()
+            return f"SSH Connection failed: {str(e)}"
 
 
 # Fetch data from Proxmox API
@@ -66,14 +103,50 @@ def get_data_from_proxapi(url):
     return response.json()["data"]
 
 
+# Seconds a guest's config is reused before being fetched again. Configs rarely
+# change, and they are needed on every refresh (MAC lookup, config panel).
+CONFIG_TTL = 30
+
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def cached(key, ttl, loader):
+    """Return loader()'s result, reusing it for `ttl` seconds. Errors aren't cached."""
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.monotonic() - hit[0] < ttl:
+            return hit[1]
+    value = loader()
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), value)
+    return value
+
+
 def get_vm_config(vmid, vm_type):
-    """Fetch vm/lxc config"""
+    """Fetch vm/lxc config (cached for CONFIG_TTL seconds)"""
     if vm_type == "vm":
         guesttype = "qemu"
     else:
         guesttype = "lxc"
     url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/config"
-    return get_data_from_proxapi(url)
+    return cached(("config", url), CONFIG_TTL, lambda: get_data_from_proxapi(url))
+
+
+def get_guests():
+    """All VMs and LXCs of the node, with their current status, in two requests.
+
+    The list endpoints already include status, CPU, memory, disk and network
+    counters, so no per-guest status request is needed. Each entry gets a
+    "type" of "VM" or "LXC".
+    """
+    guests = []
+    for kind, label in (("qemu", "VM"), ("lxc", "LXC")):
+        for guest in get_data_from_proxapi(
+            f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{kind}"
+        ):
+            guests.append({**guest, "type": label})
+    return sorted(guests, key=lambda g: g["vmid"])
 
 
 def get_vmids():
@@ -196,8 +269,16 @@ def get_pve_subnets():
     return [item["cidr"] for item in data if "cidr" in item]
 
 
-def find_vm_ip_address():
-    """Find IP addresses of VMs based on their MAC addresses."""
+def find_vm_ip_address(guests=None):
+    """Find IP addresses of VMs based on their MAC addresses.
+
+    `guests` is the list from get_guests(); it is fetched if not given.
+    """
+    if guests is None:
+        guests = get_guests()
+    vmid_data = {
+        g["vmid"]: {"type": "qemu" if g["type"] == "VM" else "lxc"} for g in guests
+    }
     ip_table = {}
     if SSH_HOST:
         neigh_data = ssh_execute_command(
@@ -207,13 +288,11 @@ def find_vm_ip_address():
         matches = pattern.findall(neigh_data)
         mac_to_ip = {mac.upper(): ip for ip, mac in matches}
 
-        vmid_data = get_vmids_dict()
         for vmid, info in vmid_data.items():
-            url = (
-                f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
-            )
             try:
-                config_data = get_data_from_proxapi(url)
+                config_data = get_vm_config(
+                    vmid, "vm" if info["type"] == "qemu" else "lxc"
+                )
             except requests.RequestException:
                 logging.getLogger().warning("Could not read config of %s", vmid)
                 continue
@@ -228,7 +307,6 @@ def find_vm_ip_address():
                     "ip": mac_to_ip.get(mac_address, "N/A"),
                 }
     else:
-        vmid_data = get_vmids_dict()
         for vmid, info in vmid_data.items():
             if info["type"] == "qemu":
                 ip_table[vmid] = {

@@ -26,9 +26,9 @@ from utils import (
     get_cpu_temperature,
     get_data_from_proxapi,
     get_gpu_stats,
+    get_guests,
     get_vm_config,
     get_vm_data,
-    get_vmids,
 )
 
 # Configure logging
@@ -416,20 +416,8 @@ class ProxmonApp(App):
     @guarded
     def update_table(self):
         """Fetch the VM and LXC data (worker thread), then show it in the table."""
-        vmids = get_vmids()
-        vm_data = []
-        for vmid in vmids["vm"]:
-            json_data = get_vm_data(vmid, type="vm")
-            json_data["type"] = "VM"
-            vm_data.append(json_data)
-
-        for vmid in vmids["lxc"]:
-            json_data = get_vm_data(vmid, type="lxc")
-            json_data["type"] = "LXC"
-            vm_data.append(json_data)
-
-        vm_data = sorted(vm_data, key=lambda d: d["vmid"])
-        ip_data = find_vm_ip_address()
+        vm_data = get_guests()
+        ip_data = find_vm_ip_address(vm_data)
         self._ui(self.render_table, vm_data, ip_data)
 
     def render_table(self, vm_data, ip_data):
@@ -453,12 +441,12 @@ class ProxmonApp(App):
                 "🟢 Running" if data["status"] == "running" else "🔴 Stopped",
                 data["type"],
                 data["name"],
-                "  " + str(data["cpus"]),
+                "  " + str(data.get("cpus", 0)),
                 str(round(data.get("cpu", 0) * 100, 2)),
                 str(round(mem_usage, 0)),
                 str(round(data.get("maxdisk", 0) / (1024 * 1024 * 1024), 0)),
-                str(round(data["netin"] / (1024 * 1024), 2)),
-                str(round(data["netout"] / (1024 * 1024), 2)),
+                str(round(data.get("netin", 0) / (1024 * 1024), 2)),
+                str(round(data.get("netout", 0) / (1024 * 1024), 2)),
                 ip_data.get(data["vmid"], {}).get("mac") or "N/A",
                 ip_data.get(data["vmid"], {}).get("ip") or "N/A",
             )
