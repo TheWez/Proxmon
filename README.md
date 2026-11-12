@@ -32,7 +32,7 @@ Proxmox monitoring cli tool
 - Add an API token for the api user, write down the secret
 - Grant appropriate permissions to the user and the API token
 ### 2. Create .env file
-Note, all SSH_ parameters are optional. If provided, they will allow looking up VMs IP addresses and the host's CPU temperature
+Note, all SSH_ parameters are optional. If provided, they will allow looking up VMs IP addresses (via the host's ARP table)
 ```bash
 PROXMOX_HOST = https://proxmox.myorg.com:8006
 TOKEN_ID = api@pve!api-token
@@ -44,6 +44,8 @@ SSH_USER = api
 SSH_PASSWORD = ssh-password
 ```
     
+CPU temperature and GPU usage/VRAM are read locally (Proxmon must run on the PVE host): AMD via amdgpu sysfs, NVIDIA via `nvidia-smi`. The top bar segment is hidden if no GPU is found.
+
 ## Usage
 
 Run the tool with:

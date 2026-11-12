@@ -17,8 +17,10 @@ from textual.widgets import DataTable, Footer, Header, Static
 from utils import (
     draw_vertical_bar_chart,
     find_vm_ip_address,
+    format_gpu_summary,
     get_cpu_temperature,
     get_data_from_proxapi,
+    get_gpu_stats,
     get_vm_config,
     get_vm_data,
     get_vmids,
@@ -135,12 +137,16 @@ class ProxmonApp(App):
         disk_total = node_data.get("rootfs").get("total") / (1024 * 1024 * 1024)
         disk_used = node_data.get("rootfs").get("used") / (1024 * 1024 * 1024)
 
+        gpu_summary = format_gpu_summary(get_gpu_stats())
+        gpu_text = f"｜ {gpu_summary} " if gpu_summary else ""
+
         text = (
             f"   {node_data.get('pveversion')} "
             f"｜   CPU: {node_data.get('cpuinfo').get('model')} "
             f"｜ 󰽘 Cores: {node_data.get('cpuinfo').get('cores')} "
             f"｜ 󰄪 Load: {cpu_load:.0f}% "
             f"｜ 🌡️Temp: {str(temp.get('CPU', 'N/A'))} °C "
+            f"{gpu_text}"
             f"｜   RAM: {used_memory:.0f}/{total_memory:.0f} GB "
             f"｜  Disk: {disk_used:.0f}/{disk_total:.0f} GB "
             f"｜ 󰔚 Uptime: {formatted_uptime} "
