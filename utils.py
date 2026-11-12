@@ -110,6 +110,8 @@ def draw_vertical_bar_chart(
     color="white",
     char="░",
     max_output_width=200,
+    y_min=None,
+    y_max=None,
 ):
     """
     Draws a vertical bar chart with consistent padding and adjustable width.
@@ -121,21 +123,23 @@ def draw_vertical_bar_chart(
         decimal_places: The number of decimal places to display.
         chart_width: The width of the bars in the chart. If None, it defaults to the length of the data.
         max_output_width: Maximum width of the output string.
+        y_min, y_max: Optional fixed scale (e.g. 0 and 100 for a percentage);
+            by default the scale is taken from the data.
     Returns:
         A string representation of the chart.
     """
     if chart_width is None:
         chart_width = len(data)
 
-    max_value = max(data)
-    min_value = min(data)
+    max_value = max(data) if y_max is None else y_max
+    min_value = min(data) if y_min is None else y_min
     range_value = max_value - min_value
 
     chart = [[" " for _ in range(chart_width)] for _ in range(height)]
 
     for i, value in enumerate(data):
         normalized_value = (
-            int((value - min_value) / range_value * (height - 1))
+            max(0, min(height - 1, int((value - min_value) / range_value * (height - 1))))
             if range_value > 0
             else 0
         )
@@ -284,6 +288,8 @@ def get_amd_gpus(root=GPU_SYSFS_ROOT):
             total = float(_read_text(dev / "mem_info_vram_total"))
         except (TypeError, ValueError):
             continue  # not amdgpu, or files missing
+        gtt_used = _read_text(dev / "mem_info_gtt_used")
+        gtt_total = _read_text(dev / "mem_info_gtt_total")
         gpus.append(
             {
                 "vendor": "amd",
@@ -291,6 +297,9 @@ def get_amd_gpus(root=GPU_SYSFS_ROOT):
                 "util": util,
                 "vram_used_gb": used / 1024**3,
                 "vram_total_gb": total / 1024**3,
+                # GTT = system RAM the GPU can use; the real pool on iGPUs
+                "gtt_used_gb": int(gtt_used) / 1024**3 if gtt_used else None,
+                "gtt_total_gb": int(gtt_total) / 1024**3 if gtt_total else None,
             }
         )
     return gpus
@@ -329,6 +338,8 @@ def get_nvidia_gpus():
                 "util": util,
                 "vram_used_gb": used / 1024,  # nvidia-smi reports MiB
                 "vram_total_gb": total / 1024,
+                "gtt_used_gb": None,
+                "gtt_total_gb": None,
             }
         )
     return gpus
@@ -352,8 +363,11 @@ def format_gpu_summary(gpus):
     parts = []
     for i, gpu in enumerate(gpus):
         label = f"GPU{i}" if len(gpus) > 1 else "GPU"
-        parts.append(
+        text = (
             f"{label}: {gpu['util']:.0f}% "
             f"｜ VRAM: {gpu['vram_used_gb']:.1f}/{gpu['vram_total_gb']:.1f} GB"
         )
+        if gpu.get("gtt_total_gb"):
+            text += f" ｜ GTT: {gpu['gtt_used_gb']:.1f}/{gpu['gtt_total_gb']:.1f} GB"
+        parts.append(text)
     return " ｜ ".join(parts)

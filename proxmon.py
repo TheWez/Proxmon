@@ -6,6 +6,8 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from rich.columns import Columns
+from rich.console import Group
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.text import Text
@@ -54,6 +56,9 @@ requests.packages.urllib3.disable_warnings(
 )
 
 HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
+
+# Number of samples kept for the GPU history charts
+GPU_HISTORY = 100
 
 # Global variables
 TABLE_CURSOR = dict()
@@ -106,6 +111,7 @@ class ProxmonApp(App):
     timer_rrd: Timer
     layout = Layout()
     vm_stats = {}
+    gpu_history = {}
 
     def compose(self) -> ComposeResult:
         yield Header("Proxmox Monitor")
@@ -115,6 +121,7 @@ class ProxmonApp(App):
             classes="topbar_container",
         )
         yield VerticalScroll(DataTable(id="vm_table"), id="vm_table_vs")
+        yield VerticalScroll(Static(id="gpu_charts"), id="gpu_charts_vs")
         yield VerticalScroll(Static(id="stats", expand=True))
         yield Footer()
 
@@ -180,6 +187,91 @@ class ProxmonApp(App):
         self.timer = self.set_interval(10, self.update_table)
         self.timer_node_stats = self.set_interval(10, self.update_node_stats)
         self.timer_rrd = self.set_interval(2, self.update_rrd_data)
+        self.update_gpu_charts()
+        self.timer_gpu = self.set_interval(2, self.update_gpu_charts)
+
+    def update_gpu_charts(self):
+        """Update the node-level GPU, VRAM and GTT history charts.
+
+        The panel is hidden when no supported GPU is found.
+        """
+        container = self.query_one("#gpu_charts_vs")
+        gpus = get_gpu_stats()
+        container.display = bool(gpus)
+        if not gpus:
+            return
+
+        rows = []
+        for i, gpu in enumerate(gpus):
+            label = f"GPU{i}" if len(gpus) > 1 else "GPU"
+            hist = self.gpu_history.setdefault(i, {"util": [], "vram": [], "gtt": []})
+            samples = (
+                ("util", gpu["util"]),
+                ("vram", gpu["vram_used_gb"]),
+                ("gtt", gpu.get("gtt_used_gb")),
+            )
+            for key, value in samples:
+                if value is not None:
+                    hist[key] = (hist[key] + [value])[-GPU_HISTORY:]
+
+            has_gtt = bool(gpu.get("gtt_total_gb"))
+            n_panels = 3 if has_gtt else 2
+            # panel border/padding + axis labels + column gap ~= 15 chars
+            chart_width = max(10, self.size.width // n_panels - 15)
+
+            panels = [
+                Panel(
+                    draw_vertical_bar_chart(
+                        hist["util"],
+                        height=6,
+                        chart_width=chart_width,
+                        color="green",
+                        decimal_places=0,
+                        y_min=0,
+                        y_max=100,
+                    ),
+                    title=f"{label} Usage: {gpu['util']:.0f}%",
+                    border_style="blue",
+                ),
+                Panel(
+                    draw_vertical_bar_chart(
+                        hist["vram"],
+                        height=6,
+                        chart_width=chart_width,
+                        color="cyan",
+                        decimal_places=1,
+                        y_min=0,
+                        y_max=gpu["vram_total_gb"],
+                    ),
+                    title=(
+                        f"{label} VRAM: {gpu['vram_used_gb']:.1f}"
+                        f"/{gpu['vram_total_gb']:.1f} GB"
+                    ),
+                    border_style="blue",
+                ),
+            ]
+            if has_gtt:
+                panels.append(
+                    Panel(
+                        draw_vertical_bar_chart(
+                            hist["gtt"],
+                            height=6,
+                            chart_width=chart_width,
+                            color="yellow",
+                            decimal_places=1,
+                            y_min=0,
+                            y_max=gpu["gtt_total_gb"],
+                        ),
+                        title=(
+                            f"{label} GTT: {gpu['gtt_used_gb']:.1f}"
+                            f"/{gpu['gtt_total_gb']:.1f} GB"
+                        ),
+                        border_style="blue",
+                    )
+                )
+            rows.append(Columns(panels, equal=True, expand=True))
+
+        self.query_one("#gpu_charts", Static).update(Group(*rows))
 
     def on_key(self, event) -> None:
         """Handle key events."""

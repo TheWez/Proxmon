@@ -7,6 +7,7 @@ Proxmox monitoring cli tool
 - Monitor Proxmox nodes and VMs from the command line.
 - Display resource usage such as CPU, memory, and storage.
 - Fetch and display VM statuses in real-time.
+- Live GPU usage, VRAM and GTT (AMD iGPU/dGPU) history charts, plus NVIDIA support via `nvidia-smi` (when run on the PVE host).
 - Lightweight and easy to use.
 
 ## Installation

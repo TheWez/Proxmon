@@ -6,18 +6,27 @@ DataTable {
     
 }
 
+#gpu_charts_vs{
+    height: auto;
+    max-height: 40vh;
+    display: none; /* shown once a GPU is detected */
+}
+
 #topbar_container{
-    height:3;
+    height:auto;
+    max-height:6;
     text-align: justify;
 }
 
 #vm_table_vs{
+    height: auto;
     max-height: 25vh;
 }
 
 #topbar{
-    height:3;
-    max-height: 3;
+    height:auto;
+    min-height: 3;
+    max-height: 6;
     border: round magenta;
 }
 
