@@ -24,6 +24,7 @@ from utils import (
     draw_vertical_bar_chart,
     find_vm_ip_address,
     format_gpu_summary,
+    format_used_total,
     get_cpu_temperature,
     get_data_from_proxapi,
     get_gpu_stats,
@@ -298,8 +299,8 @@ class ProxmonApp(App):
             "Name",
             "Core",
             "CPU (%)",
-            "RAM (MB)",
-            "Disk (GB)",
+            "RAM used/max (MB)",
+            "Disk used/max (GB)",
             "NetIN (MB)",
             "NetOUT (MB)",
             "MAC",
@@ -504,11 +505,6 @@ class ProxmonApp(App):
         table.clear()
 
         for idx, data in enumerate(vm_data):
-            mem_usage = (
-                (data.get("maxmem", 0)) / (1024 * 1024)
-                if data.get("mem", 0) != 0
-                else 0
-            )
             table.add_row(
                 str(data["vmid"]),
                 "🟢 Running" if data["status"] == "running" else "🔴 Stopped",
@@ -516,8 +512,10 @@ class ProxmonApp(App):
                 data["name"],
                 "  " + str(data.get("cpus", 0)),
                 str(round(data.get("cpu", 0) * 100, 2)),
-                str(round(mem_usage, 0)),
-                str(round(data.get("maxdisk", 0) / (1024 * 1024 * 1024), 0)),
+                format_used_total(data.get("mem", 0), data.get("maxmem", 0), 1024**2),
+                format_used_total(
+                    data.get("disk", 0), data.get("maxdisk", 0), 1024**3, decimals=1
+                ),
                 str(round(data.get("netin", 0) / (1024 * 1024), 2)),
                 str(round(data.get("netout", 0) / (1024 * 1024), 2)),
                 ip_data.get(data["vmid"], {}).get("mac") or "N/A",

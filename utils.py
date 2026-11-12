@@ -148,6 +148,19 @@ def vm_power_action(vmid, vm_type, action):
     return response.json()["data"]
 
 
+def format_used_total(used, total, divisor, decimals=0):
+    """Format a resource as "used/total" in the unit given by `divisor`.
+
+    A value that is 0 or unknown is shown as "-": a stopped guest uses no
+    memory, and Proxmox can't report disk usage for VMs (only for containers).
+    """
+
+    def fmt(value):
+        return f"{value / divisor:.{decimals}f}" if value else "-"
+
+    return f"{fmt(used)}/{fmt(total)}"
+
+
 def get_guests():
     """All VMs and LXCs of the node, with their current status, in two requests.
 
