@@ -37,3 +37,25 @@ ToastRack {
 Toast {
     padding: 2;
 }
+
+ConfirmScreen {
+    align: center middle;
+}
+
+#confirm_box {
+    width: 60;
+    height: auto;
+    padding: 1 2;
+    border: thick $error;
+    background: $surface;
+}
+
+#confirm_buttons {
+    height: auto;
+    margin-top: 1;
+    align: center middle;
+}
+
+#confirm_buttons Button {
+    margin: 0 2;
+}
