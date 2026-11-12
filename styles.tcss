@@ -6,6 +6,11 @@ DataTable {
     
 }
 
+#filter{
+    display: none; /* shown by "/" */
+    margin: 0 1;
+}
+
 #stats_vs{
     height: 1fr;
 }
