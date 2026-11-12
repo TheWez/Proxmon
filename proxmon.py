@@ -61,8 +61,13 @@ requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning
 )
 
-# Number of samples kept for the GPU history charts
-GPU_HISTORY = 100
+# Number of samples kept for the history charts (one per 2s tick, so 10 minutes;
+# more than a chart is wide, even on a very wide terminal)
+HISTORY_SAMPLES = 300
+
+# Share of the stats panel (below its 3-row header) given to the charts vs the config
+STATS_MAIN_RATIO = 2
+STATS_MISC_RATIO = 1
 
 # Global variables
 selected_vm = {
@@ -242,7 +247,7 @@ class ProxmonApp(App):
         )
         yield VerticalScroll(DataTable(id="vm_table"), id="vm_table_vs")
         yield VerticalScroll(Static(id="gpu_charts"), id="gpu_charts_vs")
-        yield VerticalScroll(Static(id="stats", expand=True))
+        yield VerticalScroll(Static(id="stats", expand=True), id="stats_vs")
         yield Footer()
 
     @work(thread=True)
@@ -343,7 +348,7 @@ class ProxmonApp(App):
             )
             for key, value in samples:
                 if value is not None:
-                    hist[key] = (hist[key] + [value])[-GPU_HISTORY:]
+                    hist[key] = (hist[key] + [value])[-HISTORY_SAMPLES:]
 
             has_gtt = bool(gpu.get("gtt_total_gb"))
             n_panels = 3 if has_gtt else 2
@@ -581,23 +586,38 @@ class ProxmonApp(App):
                 "netout": [],
             }
 
-        # Update stats and keep only the last 100 values
+        # Update stats and keep only the most recent values
         self.vm_stats[vmid]["ts"].append(ts)
-        self.vm_stats[vmid]["ts"] = self.vm_stats[vmid]["ts"][-100:]
+        self.vm_stats[vmid]["ts"] = self.vm_stats[vmid]["ts"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["cpu"].append(cpu)
-        self.vm_stats[vmid]["cpu"] = self.vm_stats[vmid]["cpu"][-100:]
+        self.vm_stats[vmid]["cpu"] = self.vm_stats[vmid]["cpu"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["mem"].append(mem)
-        self.vm_stats[vmid]["mem"] = self.vm_stats[vmid]["mem"][-100:]
+        self.vm_stats[vmid]["mem"] = self.vm_stats[vmid]["mem"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["netin"].append(netin)
-        self.vm_stats[vmid]["netin"] = self.vm_stats[vmid]["netin"][-100:]
+        self.vm_stats[vmid]["netin"] = self.vm_stats[vmid]["netin"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["netout"].append(netout)
-        self.vm_stats[vmid]["netout"] = self.vm_stats[vmid]["netout"][-100:]
+        self.vm_stats[vmid]["netout"] = self.vm_stats[vmid]["netout"][-HISTORY_SAMPLES:]
 
         layout = self.stats_layout()
+
+        # Fit the charts to the stats panel: two columns of two rows. Each chart
+        # needs 14 columns for its axis labels and panel border/padding, and 3
+        # rows for the panel border and the x axis.
+        stats_size = self.query_one("#stats", Static).size
+        if stats_size.height:
+            chart_width = max(10, stats_size.width // 2 - 14)
+            main_rows = (stats_size.height - 3) * STATS_MAIN_RATIO // (
+                STATS_MAIN_RATIO + STATS_MISC_RATIO
+            )
+            chart_height = max(3, min(12, main_rows // 2 - 3))
+        else:  # not laid out yet
+            chart_width, chart_height = 40, 8
+        max_mem_mb = data.get("maxmem", 0) / (1024 * 1024)
+
         vm_type_icon = "" if vm_type == "lxc" else ""
         layout["stat_header"].update(
             Panel(
@@ -613,9 +633,11 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["cpu"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="green",
+                        y_min=0,
+                        y_max=100,
                     ),
                     title="CPU Usage",
                     border_style="blue",
@@ -625,10 +647,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["mem"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="cyan",
                         decimal_places=0,
+                        y_min=0,
+                        y_max=max_mem_mb or None,
                     ),
                     title="Memory Usage",
                     border_style="blue",
@@ -638,11 +662,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["netin"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="yellow",
                         decimal_places=1,
                         char=".",
+                        y_min=0,
                     ),
                     title="Network In",
                     border_style="blue",
@@ -652,11 +677,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["netout"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="dodger_blue2",
                         decimal_places=1,
                         char=".",
+                        y_min=0,
                     ),
                     title="Network Out",
                     border_style="blue",
@@ -689,8 +715,8 @@ class ProxmonApp(App):
         layout = self.layout
         layout.split(
             Layout(name="stat_header", size=3),
-            Layout(name="main"),
-            Layout(name="misc"),
+            Layout(name="main", ratio=STATS_MAIN_RATIO),
+            Layout(name="misc", ratio=STATS_MISC_RATIO),
         )
         layout["main"].split_column(
             Layout(name="process"),

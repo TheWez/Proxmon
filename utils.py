@@ -227,6 +227,7 @@ def draw_vertical_bar_chart(
         value_width: The total width of the formatted numerical value.
         decimal_places: The number of decimal places to display.
         chart_width: The width of the bars in the chart. If None, it defaults to the length of the data.
+            If there are more samples than columns, the most recent ones are shown.
         max_output_width: Maximum width of the output string.
         y_min, y_max: Optional fixed scale (e.g. 0 and 100 for a percentage);
             by default the scale is taken from the data.
@@ -235,6 +236,9 @@ def draw_vertical_bar_chart(
     """
     if chart_width is None:
         chart_width = len(data)
+    # The chart is chart_width columns wide: show the most recent samples (and
+    # scale to them) rather than the oldest ones.
+    data = data[-chart_width:]
 
     max_value = max(data) if y_max is None else y_max
     min_value = min(data) if y_min is None else y_min
