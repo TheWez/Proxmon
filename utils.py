@@ -151,6 +151,69 @@ def format_used_total(used, total, divisor, decimals=0):
     return f"{fmt(used)}/{fmt(total)}"
 
 
+def _ip_sort_key(ip):
+    """Sort IPv4 addresses numerically; anything else (e.g. N/A) last."""
+    try:
+        return (0, tuple(int(part) for part in (ip or "").split("/")[0].split(".")))
+    except ValueError:
+        return (1, ())
+
+
+# How each table column is sorted: column name -> f(guest, ip_entry). Values are
+# the underlying numbers (not the formatted text), so 9 sorts before 10.
+SORT_KEYS = {
+    "ID": lambda g, ip: g["vmid"],
+    "Status": lambda g, ip: g.get("status", ""),
+    "Type": lambda g, ip: g.get("type", ""),
+    "Name": lambda g, ip: g.get("name", "").lower(),
+    "Node": lambda g, ip: g.get("node", ""),
+    "Core": lambda g, ip: g.get("cpus", 0),
+    "CPU (%)": lambda g, ip: g.get("cpu", 0),
+    "RAM used/max (MB)": lambda g, ip: (g.get("mem", 0), g.get("maxmem", 0)),
+    "Disk used/max (GB)": lambda g, ip: (g.get("disk", 0), g.get("maxdisk", 0)),
+    "NetIN (MB)": lambda g, ip: g.get("netin", 0),
+    "NetOUT (MB)": lambda g, ip: g.get("netout", 0),
+    "MAC": lambda g, ip: (ip.get("mac") or "").upper(),
+    "IP": lambda g, ip: _ip_sort_key(ip.get("ip")),
+}
+
+
+def sort_guests(guests, ip_data, column="ID", reverse=False):
+    """Sort guests by a table column (ties broken by ID). Unknown column: by ID."""
+    key = SORT_KEYS.get(column, SORT_KEYS["ID"])
+    return sorted(
+        guests,
+        key=lambda g: (key(g, ip_data.get(g["vmid"], {})), g["vmid"]),
+        reverse=reverse,
+    )
+
+
+def filter_guests(guests, ip_data, text):
+    """Keep the guests matching every whitespace-separated term in `text`.
+
+    Terms are matched case-insensitively against the guest's ID, name, type,
+    status, node, MAC and IP.
+    """
+    terms = text.lower().split()
+    if not terms:
+        return list(guests)
+
+    def haystack(guest):
+        ip = ip_data.get(guest["vmid"], {})
+        fields = (
+            guest["vmid"],
+            guest.get("name"),
+            guest.get("type"),
+            guest.get("status"),
+            guest.get("node"),
+            ip.get("mac"),
+            ip.get("ip"),
+        )
+        return " ".join(str(f) for f in fields if f).lower()
+
+    return [g for g in guests if all(term in haystack(g) for term in terms)]
+
+
 # Seconds the list of cluster nodes is reused when NODES="*"
 NODE_DISCOVERY_TTL = 60
 

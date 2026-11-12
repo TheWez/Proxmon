@@ -59,6 +59,17 @@ or, when using uv:
 ```bash
 uv run python proxmon.py
 ```
+
+### Keys
+
+| Key | Action |
+|---|---|
+| Up / Down | Move between guests (the stats panel follows) |
+| `s` | Start the guest, or shut it down (asks first) |
+| `x` | Force stop (asks first) |
+| `o` / `r` | Sort by the next column / reverse the sort (or click a column header) |
+| `/` | Filter guests by name, ID, status, node, IP or MAC; Enter keeps it, Esc clears it |
+| Ctrl+Q | Quit |
 ## Demo
 
 Here is a quick demo of Proxmon in action:

@@ -14,14 +14,16 @@ from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Button, DataTable, Footer, Header, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
 from config import NODE, PROXMOX_API_URL, missing_settings
 from utils import (
     draw_vertical_bar_chart,
+    filter_guests,
     find_vm_ip_address,
     format_gpu_summary,
     format_used_total,
@@ -32,6 +34,7 @@ from utils import (
     get_nodes,
     get_vm_config,
     get_vm_data,
+    sort_guests,
     vm_power_action,
 )
 
@@ -185,6 +188,10 @@ class ProxmonApp(App):
         ("󰌑", "", "Select"),
         ("s", "toggle_vm", "Start/Stop"),
         ("x", "force_stop", "Force Stop"),
+        ("o", "next_sort", "Sort"),
+        ("r", "reverse_sort", "Reverse"),
+        ("/", "filter", "Filter"),
+        Binding("escape", "clear_filter", "Clear filter", show=False),
         ("Ctrl+Q", "quit", "Quit"),
     ]
 
@@ -201,6 +208,10 @@ class ProxmonApp(App):
         self._guests = []  # guests currently in the table, in row order
         self._multi_node = False  # several nodes shown: add a Node column etc.
         self.current_node = NODE  # the node whose status the top bar shows
+        self.sort_column = "ID"  # table column the guests are sorted by
+        self.sort_reverse = False
+        self.filter_text = ""
+        self._table_data = ([], {}, False)  # last fetched (guests, ip_data, multi_node)
 
     def _report_failure(self, name, exc, label=None):
         """Called from a worker thread when a refresh fails."""
@@ -247,6 +258,10 @@ class ProxmonApp(App):
             Static("Proxmox Node Monitor", id="topbar"),
             id="topbar_container",
             classes="topbar_container",
+        )
+        yield Input(
+            placeholder="Filter: name, id, status, node, IP... (Enter to keep, Esc to clear)",
+            id="filter",
         )
         yield VerticalScroll(DataTable(id="vm_table"), id="vm_table_vs")
         yield VerticalScroll(Static(id="gpu_charts"), id="gpu_charts_vs")
@@ -305,7 +320,9 @@ class ProxmonApp(App):
         if multi_node:
             columns.insert(4, "Node")  # after Name
         table.clear(columns=True)
-        table.add_columns(*columns)
+        for name in columns:
+            arrow = (" ▼" if self.sort_reverse else " ▲") if name == self.sort_column else ""
+            table.add_column(name + arrow, key=name)
         self._multi_node = multi_node
 
     def on_mount(self):
@@ -316,6 +333,7 @@ class ProxmonApp(App):
         table.cursor_type = "row"
         table.zebra_stripes = False
         table.border = True
+        table.focus()  # not the (hidden) filter box, which would otherwise get the focus
         self.update_table()
         self.update_node_stats()
 
@@ -416,6 +434,52 @@ class ProxmonApp(App):
 
         self.query_one("#gpu_charts", Static).update(Group(*rows))
 
+    def _set_sort(self, column, reverse):
+        self.sort_column, self.sort_reverse = column, reverse
+        self._draw_table(rebuild_columns=True)
+
+    def action_next_sort(self) -> None:
+        """Sort by the next column."""
+        columns = list(TABLE_COLUMNS)
+        if self._multi_node:
+            columns.insert(4, "Node")
+        index = columns.index(self.sort_column) if self.sort_column in columns else -1
+        self._set_sort(columns[(index + 1) % len(columns)], False)
+
+    def action_reverse_sort(self) -> None:
+        """Reverse the sort order."""
+        self._set_sort(self.sort_column, not self.sort_reverse)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        """Click a column header to sort by it; click again to reverse."""
+        column = str(event.column_key.value)
+        same = column == self.sort_column
+        self._set_sort(column, not self.sort_reverse if same else False)
+
+    def action_filter(self) -> None:
+        """Show the filter box and start typing."""
+        box = self.query_one("#filter", Input)
+        box.display = True
+        box.focus()
+
+    def action_clear_filter(self) -> None:
+        """Clear the filter, hide the box and go back to the table."""
+        box = self.query_one("#filter", Input)
+        if box.display or box.value:
+            box.value = ""  # on_input_changed redraws the table
+            box.display = False
+            self.query_one("#vm_table", DataTable).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self.filter_text = event.value.strip()
+            self._draw_table()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the filter box keeps the filter and returns to the table."""
+        if event.input.id == "filter":
+            self.query_one("#vm_table", DataTable).focus()
+
     def _highlighted_guest(self):
         """The guest on the highlighted table row, or None."""
         table = self.query_one("#vm_table", DataTable)
@@ -507,7 +571,26 @@ class ProxmonApp(App):
 
     def render_table(self, vm_data, ip_data, multi_node=False):
         """Show the VM and LXC data in the table (UI thread)."""
+        self._table_data = (vm_data, ip_data, multi_node)
+        self._draw_table()
+
+    def _draw_table(self, rebuild_columns=False):
+        """Sort, filter and draw the last fetched data (UI thread)."""
+        all_guests, ip_data, multi_node = self._table_data
         table = self.query_one("#vm_table", DataTable)
+        filter_box = self.query_one("#filter", Input)
+
+        if self.sort_column == "Node" and not multi_node:
+            self.sort_column, self.sort_reverse = "ID", False  # no such column now
+            rebuild_columns = True
+        vm_data = filter_guests(
+            sort_guests(all_guests, ip_data, self.sort_column, self.sort_reverse),
+            ip_data,
+            self.filter_text,
+        )
+        filter_box.border_title = (
+            f"{len(vm_data)}/{len(all_guests)} guests" if self.filter_text else ""
+        )
 
         # Remember which guest the cursor is on, so it stays on that guest even
         # if guests are added or removed above it
@@ -522,6 +605,8 @@ class ProxmonApp(App):
         if multi_node != self._multi_node:
             self._setup_columns(multi_node)
             self.update_node_stats()  # the top bar names the node when several are shown
+        elif rebuild_columns:
+            self._setup_columns(multi_node)
         table.clear()
 
         for idx, data in enumerate(vm_data):
@@ -552,7 +637,8 @@ class ProxmonApp(App):
         elif vm_data:
             table.move_cursor(row=min(max(previous_row, 0), len(vm_data) - 1))
 
-        table.focus()
+        if not (filter_box.display and filter_box.has_focus):  # not while typing a filter
+            table.focus()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         """The highlighted row is the selected VM/LXC: show its stats."""
