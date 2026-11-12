@@ -81,6 +81,18 @@ https://github.com/Sr-vZ/Proxmon/raw/refs/heads/main/assets/Proxmon_Demo.mp4
 
 Contributions are welcome! Please fork the repository and submit a pull request.
 
+### Running the tests
+
+```bash
+pip install -e ".[test]"   # or: pip install pytest
+pytest
+```
+
+The tests need no Proxmox server, GPU or network. `tests/fakepve.py` is a small
+fake Proxmox API (two nodes, six guests) that replaces `requests`, and the app
+is run headless with Textual's test driver, pressing keys the way a user would.
+The full run takes about half a minute, mostly waiting for the app's timers.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
