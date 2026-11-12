@@ -261,11 +261,8 @@ class ProxmonApp(App):
         free_memory = node_data.get("memory").get("free", 0) / (1024 * 1024 * 1024)
         total_memory = node_data.get("memory").get("total", 0) / (1024 * 1024 * 1024)
         used_memory = round(total_memory - free_memory, 0)
-        cpu_load = (
-            float(node_data.get("loadavg")[0])
-            / int(node_data.get("cpuinfo").get("cores"))
-            * 100
-        )
+        # "cpu" is the node's current CPU utilisation as a 0-1 fraction
+        cpu_usage = float(node_data.get("cpu", 0)) * 100
         uptime = int(node_data.get("uptime", 0))
         formatted_uptime = f"{uptime // 86400:02}:{(uptime % 86400) // 3600:02}:{(uptime % 3600) // 60:02}:{uptime % 60:02}"
         # disk_free = node_data.get("rootfs").get("free") / (1024 * 1024 * 1024)
@@ -279,7 +276,7 @@ class ProxmonApp(App):
             f"   {node_data.get('pveversion')} "
             f"｜   CPU: {node_data.get('cpuinfo').get('model')} "
             f"｜ 󰽘 Cores: {node_data.get('cpuinfo').get('cores')} "
-            f"｜ 󰄪 Load: {cpu_load:.0f}% "
+            f"｜ 󰄪 Usage: {cpu_usage:.0f}% "
             f"｜ 🌡️Temp: {str(temp.get('CPU', 'N/A'))} °C "
             f"{gpu_text}"
             f"｜   RAM: {used_memory:.0f}/{total_memory:.0f} GB "
