@@ -45,7 +45,9 @@ SSH_USER = api
 SSH_PASSWORD = ssh-password
 ```
     
-CPU temperature and GPU usage/VRAM are read locally (Proxmon must run on the PVE host): AMD via amdgpu sysfs, NVIDIA via `nvidia-smi`. The top bar segment is hidden if no GPU is found.
+**Clusters:** by default only `NODE` is monitored. Set `NODES` to a comma-separated list (`NODES = pve1,pve2`) or `*` (every online node) to show the guests of several nodes in one table, with a `Node` column. Start/stop, stats and config use each guest's own node, the top bar shows the status of the highlighted guest's node, and a node that can't be reached is reported without hiding the others. `NODE` must be the node Proxmon runs on.
+
+CPU temperature and GPU usage/VRAM are read locally (Proxmon must run on the PVE host, so they are only shown for `NODE`): AMD via amdgpu sysfs, NVIDIA via `nvidia-smi`. The top bar segment is hidden if no GPU is found.
 
 ## Usage
 

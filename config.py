@@ -13,7 +13,10 @@ load_dotenv()
 PROXMOX_API_URL = os.getenv("PROXMOX_HOST")
 API_TOKEN_ID = os.getenv("TOKEN_ID")
 API_TOKEN_SECRET = os.getenv("TOKEN_SECRET")
-NODE = os.getenv("NODE")
+NODE = os.getenv("NODE")  # the node Proxmon runs on (local sensors, SSH lookups)
+# Optional: nodes to monitor, comma-separated ("pve1,pve2"), or "*" for every
+# online node of the cluster. Defaults to NODE alone.
+NODES = os.getenv("NODES", "")
 
 # Optional SSH access to the Proxmox host (used to look up guest IP addresses)
 SSH_HOST = os.getenv("SSH_HOST")
