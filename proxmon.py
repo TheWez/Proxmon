@@ -15,9 +15,10 @@ from rich.panel import Panel
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import Button, DataTable, Footer, Header, Static
 
 from utils import (
     draw_vertical_bar_chart,
@@ -29,6 +30,7 @@ from utils import (
     get_guests,
     get_vm_config,
     get_vm_data,
+    vm_power_action,
 )
 
 # Configure logging
@@ -58,46 +60,16 @@ requests.packages.urllib3.disable_warnings(
     requests.packages.urllib3.exceptions.InsecureRequestWarning
 )
 
-HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
-
 # Number of samples kept for the GPU history charts
 GPU_HISTORY = 100
 
 # Global variables
-TABLE_CURSOR = dict()
 selected_vm = {
     "vmid": None,
     "type": None,
     "name": None,
     "status": None,
 }
-
-
-def toggle_vm(self):
-    """Start or stop the selected VM or LXC."""
-    global selected_vm
-    if selected_vm["vmid"] is None:
-        self.notify("Select a VM/LXC first!", severity="warning")
-        return
-
-    vmid = selected_vm["vmid"]
-    vm_type = selected_vm["type"]
-    vm_status = selected_vm["status"].split(" ")[1].lower()
-    data = get_vm_data(selected_vm["vmid"], selected_vm["type"])
-    vm_status = data["status"]
-    vm_name = selected_vm["name"]
-    guesttype = "qemu" if vm_type == "vm" else "lxc"
-    if vm_status == "running":
-        self.notify(f"{vm_name} {vm_type} Shutting down!")
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/shutdown"
-    else:
-        self.notify(f"{vm_name} {vm_type} Starting!")
-        url = (
-            f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/start"
-        )
-    response = requests.post(url, headers=HEADERS, verify=False)
-    response.raise_for_status()
-    return response.json()
 
 
 def coalesced(fn):
@@ -170,13 +142,44 @@ def guarded(fn):
     return wrapper
 
 
+class ConfirmScreen(ModalScreen[bool]):
+    """Small yes/no dialog. "No" has the focus, so Enter cancels."""
+
+    BINDINGS = [
+        ("y", "answer(True)", "Yes"),
+        ("n", "answer(False)", "No"),
+        ("escape", "answer(False)", "Cancel"),
+    ]
+
+    def __init__(self, message):
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm_box"):
+            yield Static(self.message, id="confirm_message")
+            with Horizontal(id="confirm_buttons"):
+                yield Button("Yes (y)", variant="error", id="confirm_yes")
+                yield Button("No (n)", variant="primary", id="confirm_no")
+
+    def on_mount(self):
+        self.query_one("#confirm_no", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm_yes")
+
+    def action_answer(self, answer: bool) -> None:
+        self.dismiss(answer)
+
+
 class ProxmonApp(App):
     CSS_PATH = "styles.tcss"
     BINDINGS = [
         ("", "prev_entry", "Up"),
         ("", "next_entry", "Down"),
         ("󰌑", "", "Select"),
-        ("S", "toggle_vm", "Start/Stop"),
+        ("s", "toggle_vm", "Start/Stop"),
+        ("x", "force_stop", "Force Stop"),
         ("Ctrl+Q", "quit", "Quit"),
     ]
 
@@ -190,6 +193,7 @@ class ProxmonApp(App):
         super().__init__(*args, **kwargs)
         self._failing = {}  # refresh name -> error text, while that refresh is failing
         self._failing_lock = threading.Lock()
+        self._guests = []  # guests currently in the table, in row order
 
     def _report_failure(self, name, exc):
         """Called from a worker thread when a refresh fails."""
@@ -402,14 +406,77 @@ class ProxmonApp(App):
 
         self.query_one("#gpu_charts", Static).update(Group(*rows))
 
-    def on_key(self, event) -> None:
-        """Handle key events."""
-        if event.key == "s":
-            try:
-                toggle_vm(self)
-            except requests.RequestException as exc:
-                self.notify(describe_error(exc), severity="error")
-            self.update_table()
+    def _highlighted_guest(self):
+        """The guest on the highlighted table row, or None."""
+        table = self.query_one("#vm_table", DataTable)
+        if table.row_count and 0 <= table.cursor_row < len(self._guests):
+            return self._guests[table.cursor_row]
+        return None
+
+    @staticmethod
+    def _guest_label(guest):
+        return f"{guest['name']} ({guest['type']} {guest['vmid']})"
+
+    def _confirm_then(self, message, action, guest):
+        def answered(yes):
+            if yes:
+                self._power(guest, action)
+
+        self.push_screen(ConfirmScreen(message), answered)
+
+    def action_toggle_vm(self) -> None:
+        """Start the highlighted guest if it is stopped, otherwise shut it down."""
+        guest = self._highlighted_guest()
+        if guest is None:
+            self.notify("Select a VM/LXC first!", severity="warning")
+        elif guest["status"] == "running":
+            self._confirm_then(
+                f"Shut down {self._guest_label(guest)}?\n(clean shutdown)",
+                "shutdown",
+                guest,
+            )
+        else:
+            self._power(guest, "start")
+
+    def action_force_stop(self) -> None:
+        """Immediately stop the highlighted guest (like pulling the power cord)."""
+        guest = self._highlighted_guest()
+        if guest is None:
+            self.notify("Select a VM/LXC first!", severity="warning")
+        elif guest["status"] != "running":
+            self.notify(f"{self._guest_label(guest)} is not running", severity="warning")
+        else:
+            self._confirm_then(
+                f"Force stop {self._guest_label(guest)}?\n"
+                "This cuts power without a clean shutdown.",
+                "stop",
+                guest,
+            )
+
+    @work(thread=True)
+    def _power(self, guest, action):
+        """Send a power action to Proxmox (worker thread)."""
+        label = self._guest_label(guest)
+        expected = "stopped" if action == "start" else "running"
+        try:
+            # the table can be up to 10s old: make sure we are acting on what the user saw
+            current = get_vm_data(guest["vmid"], guest["type"].lower())["status"]
+            if current != expected:
+                self._ui(self.notify, f"{label} is now {current}; nothing done", severity="warning")
+                self._ui(self.update_table)
+                return
+            vm_power_action(guest["vmid"], guest["type"].lower(), action)
+        except Exception as exc:
+            self._ui(
+                self.notify,
+                f"Could not {action} {label}: {describe_error(exc)}",
+                severity="error",
+            )
+            return
+        done = {"start": "Starting", "shutdown": "Shutting down", "stop": "Stopping"}[action]
+        self._ui(self.notify, f"{done} {label}")
+        # the task runs asynchronously on the host: refresh shortly after
+        self._ui(self.set_timer, 2.0, self.update_table)
 
     @work(thread=True)
     @coalesced
@@ -422,11 +489,17 @@ class ProxmonApp(App):
 
     def render_table(self, vm_data, ip_data):
         """Show the VM and LXC data in the table (UI thread)."""
-        global TABLE_CURSOR
         table = self.query_one("#vm_table", DataTable)
 
-        # Store the current cursor position
-        selected_row = table.cursor_row
+        # Remember which guest the cursor is on, so it stays on that guest even
+        # if guests are added or removed above it
+        previous_row = table.cursor_row
+        previous_vmid = (
+            self._guests[previous_row]["vmid"]
+            if 0 <= previous_row < len(self._guests)
+            else None
+        )
+        self._guests = vm_data
 
         table.clear()
 
@@ -449,35 +522,33 @@ class ProxmonApp(App):
                 str(round(data.get("netout", 0) / (1024 * 1024), 2)),
                 ip_data.get(data["vmid"], {}).get("mac") or "N/A",
                 ip_data.get(data["vmid"], {}).get("ip") or "N/A",
+                key=str(data["vmid"]),
             )
 
         # Restore the cursor position
-        if selected_row is not None and selected_row < len(table.rows):
-            table.move_cursor(row=selected_row)
+        vmids = [data["vmid"] for data in vm_data]
+        if previous_vmid in vmids:
+            table.move_cursor(row=vmids.index(previous_vmid))
+        elif vm_data:
+            table.move_cursor(row=min(max(previous_row, 0), len(vm_data) - 1))
 
         table.focus()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle row selection in the data table."""
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """The highlighted row is the selected VM/LXC: show its stats."""
         global selected_vm
-        global TABLE_CURSOR
-        table = self.query_one("#vm_table", DataTable)
-        row_key = event.row_key
-        row_data = table.get_row(row_key)
-
-        # selected_vm.update({
-        #     "name": row_data[3],
-        #     "vmid": row_data[0],
-        #     "type": row_data[2].lower(),
-        #     "status": row_data[1],
-        # })
-        selected_vm["name"] = row_data[3]
-        selected_vm["vmid"] = row_data[0]
-        selected_vm["type"] = row_data[2].lower()
-        selected_vm["status"] = row_data[1]
-
-        TABLE_CURSOR = {"cursor_row": event.cursor_row, "row_key": event.row_key}
-        self.update_rrd_data()
+        if not 0 <= event.cursor_row < len(self._guests):
+            return
+        guest = self._guests[event.cursor_row]
+        changed = selected_vm["vmid"] != guest["vmid"]
+        selected_vm.update(
+            vmid=guest["vmid"],
+            type=guest["type"].lower(),
+            name=guest["name"],
+            status=guest["status"],
+        )
+        if changed:
+            self.update_rrd_data()
 
     @work(thread=True)
     @coalesced

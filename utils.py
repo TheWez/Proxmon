@@ -133,6 +133,21 @@ def get_vm_config(vmid, vm_type):
     return cached(("config", url), CONFIG_TTL, lambda: get_data_from_proxapi(url))
 
 
+def vm_power_action(vmid, vm_type, action):
+    """Start, gracefully shut down, or force-stop a VM or LXC.
+
+    action is "start", "shutdown" (ACPI/clean shutdown) or "stop" (immediate,
+    like pulling the power cord). Returns the Proxmox task id.
+    """
+    if action not in ("start", "shutdown", "stop"):
+        raise ValueError(f"unknown power action: {action}")
+    guesttype = "qemu" if vm_type == "vm" else "lxc"
+    url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/{action}"
+    response = requests.post(url, headers=HEADERS, verify=False, timeout=API_TIMEOUT)
+    response.raise_for_status()
+    return response.json()["data"]
+
+
 def get_guests():
     """All VMs and LXCs of the node, with their current status, in two requests.
 
