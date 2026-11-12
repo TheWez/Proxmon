@@ -1,6 +1,10 @@
 import logging
 import os
 import re
+import shutil
+import subprocess
+from functools import lru_cache
+from pathlib import Path
 
 import paramiko
 import requests
@@ -106,6 +110,8 @@ def draw_vertical_bar_chart(
     color="white",
     char="░",
     max_output_width=200,
+    y_min=None,
+    y_max=None,
 ):
     """
     Draws a vertical bar chart with consistent padding and adjustable width.
@@ -117,21 +123,23 @@ def draw_vertical_bar_chart(
         decimal_places: The number of decimal places to display.
         chart_width: The width of the bars in the chart. If None, it defaults to the length of the data.
         max_output_width: Maximum width of the output string.
+        y_min, y_max: Optional fixed scale (e.g. 0 and 100 for a percentage);
+            by default the scale is taken from the data.
     Returns:
         A string representation of the chart.
     """
     if chart_width is None:
         chart_width = len(data)
 
-    max_value = max(data)
-    min_value = min(data)
+    max_value = max(data) if y_max is None else y_max
+    min_value = min(data) if y_min is None else y_min
     range_value = max_value - min_value
 
     chart = [[" " for _ in range(chart_width)] for _ in range(height)]
 
     for i, value in enumerate(data):
         normalized_value = (
-            int((value - min_value) / range_value * (height - 1))
+            max(0, min(height - 1, int((value - min_value) / range_value * (height - 1))))
             if range_value > 0
             else 0
         )
@@ -234,23 +242,132 @@ def find_vm_ip_address():
 
 
 def get_cpu_temperature():
-    """Get the CPU temperature using psutil or SSH command."""
-    # if hasattr(psutil, "sensors_temperatures"):
-    #     temps = psutil.sensors_temperatures()
-    #     if "coretemp" in temps:
-    #         return {entry.label or "CPU": entry.current for entry in temps["coretemp"]}
-    #     elif "cpu_thermal" in temps:
-    #         return {"CPU": temps["cpu_thermal"][0].current}
+    """Get the CPU temperature (°C) from the local thermal zone (Proxmon runs on the PVE host)."""
     try:
-        temp = ssh_execute_command(
-            SSH_HOST,
-            SSH_USER,
-            SSH_PASSWORD,
-            "cat /sys/class/thermal/thermal_zone0/temp",
-            SSH_PORT,
-        )
-        temp = float(temp) / 1000
-    except Exception as ex:
-        logging.getLogger().exception(ex, "Could not execute ssh command")
+        temp = float(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000
+    except (OSError, ValueError):
+        logging.getLogger().exception("Could not read CPU temperature")
         temp = None
     return {"CPU": ("%.1f" % temp) if temp else "N/A"}
+
+
+GPU_SYSFS_ROOT = Path("/sys/class/drm")
+AMD_VENDOR_ID = "0x1002"
+
+
+def _read_text(path):
+    """Read and strip a small sysfs file; None if it can't be read."""
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=None)
+def _pci_device_name(slot, fallback):
+    """Look up a PCI device name with lspci (cached; falls back if unavailable)."""
+    try:
+        out = subprocess.run(
+            ["lspci", "-s", slot], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        # "c5:00.0 VGA compatible controller: Advanced Micro Devices ..."
+        return out.split(": ", 1)[1] if ": " in out else fallback
+    except (OSError, subprocess.SubprocessError):
+        return fallback
+
+
+def get_amd_gpus(root=GPU_SYSFS_ROOT):
+    """Read AMD GPU utilisation and VRAM from the amdgpu sysfs interface."""
+    gpus = []
+    for dev in sorted(Path(root).glob("card*/device")):
+        if _read_text(dev / "vendor") != AMD_VENDOR_ID:
+            continue
+        try:
+            util = float(_read_text(dev / "gpu_busy_percent"))
+            used = float(_read_text(dev / "mem_info_vram_used"))
+            total = float(_read_text(dev / "mem_info_vram_total"))
+        except (TypeError, ValueError):
+            continue  # not amdgpu, or files missing
+        gtt_used = _read_text(dev / "mem_info_gtt_used")
+        gtt_total = _read_text(dev / "mem_info_gtt_total")
+        gpus.append(
+            {
+                "vendor": "amd",
+                "name": _pci_device_name(dev.resolve().name, "AMD GPU"),
+                "util": util,
+                "vram_used_gb": used / 1024**3,
+                "vram_total_gb": total / 1024**3,
+                # GTT = system RAM the GPU can use; the real pool on iGPUs
+                "gtt_used_gb": int(gtt_used) / 1024**3 if gtt_used else None,
+                "gtt_total_gb": int(gtt_total) / 1024**3 if gtt_total else None,
+            }
+        )
+    return gpus
+
+
+def get_nvidia_gpus():
+    """Read NVIDIA GPU utilisation and VRAM via nvidia-smi."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    gpus = []
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            continue
+        try:
+            util, used, total = (float(x) for x in parts[1:])
+        except ValueError:
+            continue
+        gpus.append(
+            {
+                "vendor": "nvidia",
+                "name": parts[0],
+                "util": util,
+                "vram_used_gb": used / 1024,  # nvidia-smi reports MiB
+                "vram_total_gb": total / 1024,
+                "gtt_used_gb": None,
+                "gtt_total_gb": None,
+            }
+        )
+    return gpus
+
+
+def get_gpu_stats():
+    """Get GPU utilisation and VRAM usage from the local machine (the PVE host).
+
+    Returns a list of dicts (vendor, name, util, vram_used_gb, vram_total_gb),
+    empty if no supported GPU is found.
+    """
+    try:
+        return get_nvidia_gpus() + get_amd_gpus()
+    except Exception:
+        logging.getLogger().exception("Could not read GPU stats")
+        return []
+
+
+def format_gpu_summary(gpus):
+    """Format GPU stats for the top bar, e.g. 'GPU: 12% ｜ VRAM: 0.5/2.0 GB'."""
+    parts = []
+    for i, gpu in enumerate(gpus):
+        label = f"GPU{i}" if len(gpus) > 1 else "GPU"
+        text = (
+            f"{label}: {gpu['util']:.0f}% "
+            f"｜ VRAM: {gpu['vram_used_gb']:.1f}/{gpu['vram_total_gb']:.1f} GB"
+        )
+        if gpu.get("gtt_total_gb"):
+            text += f" ｜ GTT: {gpu['gtt_used_gb']:.1f}/{gpu['gtt_total_gb']:.1f} GB"
+        parts.append(text)
+    return " ｜ ".join(parts)
