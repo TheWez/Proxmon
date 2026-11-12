@@ -137,6 +137,39 @@ def coalesced(fn):
     return wrapper
 
 
+def describe_error(exc):
+    """Short, human-readable description of a refresh failure."""
+    if isinstance(exc, requests.Timeout):
+        text = "Proxmox API timed out"
+    elif isinstance(exc, requests.ConnectionError):
+        text = "Cannot reach Proxmox API"
+    elif isinstance(exc, requests.HTTPError) and exc.response is not None:
+        text = f"Proxmox API returned {exc.response.status_code} {exc.response.reason}"
+    else:
+        text = f"{type(exc).__name__}: {exc}"
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def guarded(fn):
+    """Report failures of a background refresh instead of letting them crash the app.
+
+    The last good data stays on screen; the app shows a notice (once, when the
+    problem starts and again when it clears) and keeps retrying on its timers.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            result = fn(self, *args, **kwargs)
+        except Exception as exc:
+            self._report_failure(fn.__name__, exc)
+        else:
+            self._report_success(fn.__name__)
+            return result
+
+    return wrapper
+
+
 class ProxmonApp(App):
     CSS_PATH = "styles.tcss"
     BINDINGS = [
@@ -153,10 +186,45 @@ class ProxmonApp(App):
     vm_stats = {}
     gpu_history = {}
 
-    def _ui(self, func, *args):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._failing = {}  # refresh name -> error text, while that refresh is failing
+        self._failing_lock = threading.Lock()
+
+    def _report_failure(self, name, exc):
+        """Called from a worker thread when a refresh fails."""
+        text = describe_error(exc)
+        with self._failing_lock:
+            first_for_source = name not in self._failing
+            was_healthy = not self._failing
+            self._failing[name] = text
+        if first_for_source:
+            logging.getLogger().warning("%s failed: %s", name, text, exc_info=exc)
+        if was_healthy:
+            self._ui(self.notify, f"{text}. Showing last data, retrying...", severity="error", timeout=8)
+        self._ui(self._show_status)
+
+    def _report_success(self, name):
+        """Called from a worker thread when a refresh succeeds."""
+        with self._failing_lock:
+            if name not in self._failing:
+                return
+            del self._failing[name]
+            recovered = not self._failing
+        if recovered:
+            self._ui(self.notify, "Recovered: data is live again", timeout=4)
+        self._ui(self._show_status)
+
+    def _show_status(self):
+        """Show the current problem (if any) under the title (UI thread)."""
+        with self._failing_lock:
+            problems = list(self._failing.values())
+        self.sub_title = f"⚠ {problems[0]}" if problems else ""
+
+    def _ui(self, func, *args, **kwargs):
         """Run func on the UI thread from a worker thread (no-op if app is closing)."""
         try:
-            self.call_from_thread(func, *args)
+            self.call_from_thread(func, *args, **kwargs)
         except RuntimeError:
             pass
 
@@ -174,6 +242,7 @@ class ProxmonApp(App):
 
     @work(thread=True)
     @coalesced
+    @guarded
     def update_node_stats(self):
         """Fetch node statistics (worker thread), then display them."""
         temp = get_cpu_temperature()
@@ -246,6 +315,7 @@ class ProxmonApp(App):
 
     @work(thread=True)
     @coalesced
+    @guarded
     def update_gpu_charts(self):
         """Read the GPUs (worker thread), then update the history charts."""
         self._ui(self.render_gpu_charts, get_gpu_stats())
@@ -335,11 +405,15 @@ class ProxmonApp(App):
     def on_key(self, event) -> None:
         """Handle key events."""
         if event.key == "s":
-            toggle_vm(self)
+            try:
+                toggle_vm(self)
+            except requests.RequestException as exc:
+                self.notify(describe_error(exc), severity="error")
             self.update_table()
 
     @work(thread=True)
     @coalesced
+    @guarded
     def update_table(self):
         """Fetch the VM and LXC data (worker thread), then show it in the table."""
         vmids = get_vmids()
@@ -385,8 +459,8 @@ class ProxmonApp(App):
                 str(round(data.get("maxdisk", 0) / (1024 * 1024 * 1024), 0)),
                 str(round(data["netin"] / (1024 * 1024), 2)),
                 str(round(data["netout"] / (1024 * 1024), 2)),
-                ip_data.get(data["vmid"]).get("mac", "N/A"),
-                ip_data.get(data["vmid"]).get("ip", "N/A"),
+                ip_data.get(data["vmid"], {}).get("mac") or "N/A",
+                ip_data.get(data["vmid"], {}).get("ip") or "N/A",
             )
 
         # Restore the cursor position
@@ -419,6 +493,7 @@ class ProxmonApp(App):
 
     @work(thread=True)
     @coalesced
+    @guarded
     def update_rrd_data(self):
         """Fetch stats for the selected VM or LXC (worker thread), then show them."""
         selected = dict(selected_vm)  # snapshot: the selection can change under us

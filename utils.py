@@ -24,6 +24,10 @@ SSH_PASSWORD = os.getenv("SSH_PASSWORD")
 
 HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
 
+# Seconds to wait for the Proxmox API before giving up (an unreachable host
+# would otherwise hang a refresh indefinitely).
+API_TIMEOUT = 10
+
 # Global variables
 TABLE_CURSOR = dict()
 selected_vm = {
@@ -57,7 +61,7 @@ def ssh_execute_command(host, username, password, command, port=22):
 # Fetch data from Proxmox API
 def get_data_from_proxapi(url):
     """Fetch data from Proxmox API"""
-    response = requests.get(url, headers=HEADERS, verify=False)
+    response = requests.get(url, headers=HEADERS, verify=False, timeout=API_TIMEOUT)
     response.raise_for_status()
     return response.json()["data"]
 
@@ -208,7 +212,11 @@ def find_vm_ip_address():
             url = (
                 f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
             )
-            config_data = get_data_from_proxapi(url)
+            try:
+                config_data = get_data_from_proxapi(url)
+            except requests.RequestException:
+                logging.getLogger().warning("Could not read config of %s", vmid)
+                continue
             net_config = config_data.get("net0", "")
             mac_match = re.search(
                 r"(?:hwaddr=)?([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})", net_config
@@ -230,7 +238,11 @@ def find_vm_ip_address():
                 continue
             # url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
             url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/interfaces"
-            config_data = get_data_from_proxapi(url)
+            try:
+                config_data = get_data_from_proxapi(url)
+            except requests.RequestException:
+                # e.g. a stopped container has no network interfaces to query
+                continue
             for data in config_data:
                 name = data.get("name", "")
                 if name != "lo":
