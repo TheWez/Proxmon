@@ -1,75 +1,283 @@
 import logging
-import os
 import re
 import shutil
 import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
 import paramiko
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+from config import (
+    API_TIMEOUT,
+    HEADERS,
+    NODE,
+    NODES,
+    PROXMOX_API_URL,
+    SSH_HOST,
+    SSH_PASSWORD,
+    SSH_PORT,
+    SSH_USER,
+)
 
-# Proxmox API configuration
-PROXMOX_API_URL = os.getenv("PROXMOX_HOST")
-API_TOKEN_ID = os.getenv("TOKEN_ID")
-API_TOKEN_SECRET = os.getenv("TOKEN_SECRET")
-NODE = os.getenv("NODE")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-SSH_USER = os.getenv("SSH_USER")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
+# The Proxmox API is usually served with a self-signed certificate, so requests
+# are made unverified: silence the warning that would otherwise spam the log.
+requests.packages.urllib3.disable_warnings(
+    requests.packages.urllib3.exceptions.InsecureRequestWarning
+)
 
-HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
 
-# Global variables
-TABLE_CURSOR = dict()
-selected_vm = {
-    "vmid": None,
-    "type": None,
-    "name": None,
-    "status": None,
-}
+_ssh_lock = threading.Lock()
+_ssh_client = None
+_ssh_target = None
+
+
+def _close_ssh():
+    """Drop the cached SSH connection (caller holds _ssh_lock)."""
+    global _ssh_client, _ssh_target
+    if _ssh_client is not None:
+        try:
+            _ssh_client.close()
+        except Exception:
+            pass
+    _ssh_client = _ssh_target = None
 
 
 def ssh_execute_command(host, username, password, command, port=22):
-    """SSH into a Proxmox node and execute a command."""
+    """SSH into a Proxmox node and execute a command.
+
+    The connection is kept open and reused between calls (this runs every few
+    seconds), and is re-established automatically if it has dropped.
+    """
+    global _ssh_client, _ssh_target
     if not host:
         return None
 
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            host, port=port, username=username, password=password, timeout=10
-        )
-        _, stdout, stderr = client.exec_command(command)
-        output = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
-        client.close()
-        return output if output else error
-    except Exception as e:
-        return f"SSH Connection failed: {str(e)}"
+    target = (host, port, username)
+    with _ssh_lock:
+        try:
+            for attempt in (1, 2):
+                transport = _ssh_client.get_transport() if _ssh_client else None
+                if _ssh_target != target or transport is None or not transport.is_active():
+                    _close_ssh()
+                    client = paramiko.SSHClient()
+                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.connect(
+                        host, port=port, username=username, password=password, timeout=10
+                    )
+                    _ssh_client, _ssh_target = client, target
+                try:
+                    _, stdout, stderr = _ssh_client.exec_command(command, timeout=10)
+                    output = stdout.read().decode().strip()
+                    error = stderr.read().decode().strip()
+                    return output if output else error
+                except Exception:
+                    # a cached connection can go stale without the transport
+                    # noticing: reconnect once before giving up
+                    _close_ssh()
+                    if attempt == 2:
+                        raise
+        except Exception as e:
+            _close_ssh()
+            return f"SSH Connection failed: {str(e)}"
 
 
 # Fetch data from Proxmox API
 def get_data_from_proxapi(url):
     """Fetch data from Proxmox API"""
-    response = requests.get(url, headers=HEADERS, verify=False)
+    response = requests.get(url, headers=HEADERS, verify=False, timeout=API_TIMEOUT)
     response.raise_for_status()
     return response.json()["data"]
 
 
-def get_vm_config(vmid, vm_type):
-    """Fetch vm/lxc config"""
+# Seconds a guest's config is reused before being fetched again. Configs rarely
+# change, and they are needed on every refresh (MAC lookup, config panel).
+CONFIG_TTL = 30
+
+_cache = {}
+_cache_lock = threading.Lock()
+
+
+def cached(key, ttl, loader):
+    """Return loader()'s result, reusing it for `ttl` seconds. Errors aren't cached."""
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.monotonic() - hit[0] < ttl:
+            return hit[1]
+    value = loader()
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), value)
+    return value
+
+
+def get_vm_config(vmid, vm_type, node=None):
+    """Fetch vm/lxc config (cached for CONFIG_TTL seconds)"""
     if vm_type == "vm":
         guesttype = "qemu"
     else:
         guesttype = "lxc"
-    url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/config"
-    return get_data_from_proxapi(url)
+    url = f"{PROXMOX_API_URL}/api2/json/nodes/{node or NODE}/{guesttype}/{vmid}/config"
+    return cached(("config", url), CONFIG_TTL, lambda: get_data_from_proxapi(url))
+
+
+def vm_power_action(vmid, vm_type, action, node=None):
+    """Start, gracefully shut down, or force-stop a VM or LXC.
+
+    action is "start", "shutdown" (ACPI/clean shutdown) or "stop" (immediate,
+    like pulling the power cord). Returns the Proxmox task id.
+    """
+    if action not in ("start", "shutdown", "stop"):
+        raise ValueError(f"unknown power action: {action}")
+    guesttype = "qemu" if vm_type == "vm" else "lxc"
+    url = f"{PROXMOX_API_URL}/api2/json/nodes/{node or NODE}/{guesttype}/{vmid}/status/{action}"
+    response = requests.post(url, headers=HEADERS, verify=False, timeout=API_TIMEOUT)
+    response.raise_for_status()
+    return response.json()["data"]
+
+
+def format_used_total(used, total, divisor, decimals=0):
+    """Format a resource as "used/total" in the unit given by `divisor`.
+
+    A value that is 0 or unknown is shown as "-": a stopped guest uses no
+    memory, and Proxmox can't report disk usage for VMs (only for containers).
+    """
+
+    def fmt(value):
+        return f"{value / divisor:.{decimals}f}" if value else "-"
+
+    return f"{fmt(used)}/{fmt(total)}"
+
+
+def _ip_sort_key(ip):
+    """Sort IPv4 addresses numerically; anything else (e.g. N/A) last."""
+    try:
+        return (0, tuple(int(part) for part in (ip or "").split("/")[0].split(".")))
+    except ValueError:
+        return (1, ())
+
+
+# How each table column is sorted: column name -> f(guest, ip_entry). Values are
+# the underlying numbers (not the formatted text), so 9 sorts before 10.
+SORT_KEYS = {
+    "ID": lambda g, ip: g["vmid"],
+    "Status": lambda g, ip: g.get("status", ""),
+    "Type": lambda g, ip: g.get("type", ""),
+    "Name": lambda g, ip: g.get("name", "").lower(),
+    "Node": lambda g, ip: g.get("node", ""),
+    "Core": lambda g, ip: g.get("cpus", 0),
+    "CPU (%)": lambda g, ip: g.get("cpu", 0),
+    "RAM used/max (MB)": lambda g, ip: (g.get("mem", 0), g.get("maxmem", 0)),
+    "Disk used/max (GB)": lambda g, ip: (g.get("disk", 0), g.get("maxdisk", 0)),
+    "NetIN (MB)": lambda g, ip: g.get("netin", 0),
+    "NetOUT (MB)": lambda g, ip: g.get("netout", 0),
+    "MAC": lambda g, ip: (ip.get("mac") or "").upper(),
+    "IP": lambda g, ip: _ip_sort_key(ip.get("ip")),
+}
+
+
+def sort_guests(guests, ip_data, column="ID", reverse=False):
+    """Sort guests by a table column (ties broken by ID). Unknown column: by ID."""
+    key = SORT_KEYS.get(column, SORT_KEYS["ID"])
+    return sorted(
+        guests,
+        key=lambda g: (key(g, ip_data.get(g["vmid"], {})), g["vmid"]),
+        reverse=reverse,
+    )
+
+
+def filter_guests(guests, ip_data, text):
+    """Keep the guests matching every whitespace-separated term in `text`.
+
+    Terms are matched case-insensitively against the guest's ID, name, type,
+    status, node, MAC and IP.
+    """
+    terms = text.lower().split()
+    if not terms:
+        return list(guests)
+
+    def haystack(guest):
+        ip = ip_data.get(guest["vmid"], {})
+        fields = (
+            guest["vmid"],
+            guest.get("name"),
+            guest.get("type"),
+            guest.get("status"),
+            guest.get("node"),
+            ip.get("mac"),
+            ip.get("ip"),
+        )
+        return " ".join(str(f) for f in fields if f).lower()
+
+    return [g for g in guests if all(term in haystack(g) for term in terms)]
+
+
+# Seconds the list of cluster nodes is reused when NODES="*"
+NODE_DISCOVERY_TTL = 60
+
+
+def get_nodes():
+    """The nodes to monitor, the node Proxmon runs on first.
+
+    From the NODES setting: a comma-separated list, or "*" for every online
+    node of the cluster. Without it, just NODE.
+    """
+    configured = [n.strip() for n in NODES.split(",") if n.strip()]
+    if not configured:
+        return [NODE]
+    if configured == ["*"]:
+
+        def discover():
+            data = get_data_from_proxapi(f"{PROXMOX_API_URL}/api2/json/nodes")
+            return [n["node"] for n in data if n.get("status", "online") == "online"]
+
+        configured = cached(("nodes",), NODE_DISCOVERY_TTL, discover) or [NODE]
+    return sorted(set(configured), key=lambda n: (n != NODE, n))
+
+
+def _node_guests(node):
+    guests = []
+    for kind, label in (("qemu", "VM"), ("lxc", "LXC")):
+        for guest in get_data_from_proxapi(
+            f"{PROXMOX_API_URL}/api2/json/nodes/{node}/{kind}"
+        ):
+            guests.append({**guest, "type": label, "node": node})
+    return guests
+
+
+def get_guests(errors=None):
+    """All VMs and LXCs of the monitored nodes, with their current status.
+
+    Two requests per node: the list endpoints already include status, CPU,
+    memory, disk and network counters, so no per-guest status request is
+    needed. Each entry gets a "type" ("VM" or "LXC") and its "node".
+
+    With several nodes, one that can't be reached doesn't hide the others:
+    pass a dict as `errors` to have the failures collected in it ({node:
+    exception}) instead of raised. If every node fails the first error is
+    always raised.
+    """
+    nodes = get_nodes()
+    results = {}
+    failures = {}
+    if len(nodes) == 1:
+        results[nodes[0]] = _node_guests(nodes[0])
+    else:
+        with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+            futures = {node: pool.submit(_node_guests, node) for node in nodes}
+        for node, future in futures.items():
+            try:
+                results[node] = future.result()
+            except requests.RequestException as exc:
+                failures[node] = exc
+        if failures and (errors is None or not results):
+            raise next(iter(failures.values()))
+    if errors is not None:
+        errors.update(failures)
+    guests = [g for node in nodes for g in results.get(node, [])]
+    return sorted(guests, key=lambda g: g["vmid"])
 
 
 def get_vmids():
@@ -82,11 +290,12 @@ def get_vmids():
     return vmids
 
 
-def get_vm_data(vmid, type="vm"):
+def get_vm_data(vmid, type="vm", node=None):
+    node = node or NODE
     if type == "vm":
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/qemu/{vmid}/status/current"
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
     elif type == "lxc":
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/lxc/{vmid}/status/current"
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
     else:
         return None
     return get_data_from_proxapi(url)
@@ -122,6 +331,7 @@ def draw_vertical_bar_chart(
         value_width: The total width of the formatted numerical value.
         decimal_places: The number of decimal places to display.
         chart_width: The width of the bars in the chart. If None, it defaults to the length of the data.
+            If there are more samples than columns, the most recent ones are shown.
         max_output_width: Maximum width of the output string.
         y_min, y_max: Optional fixed scale (e.g. 0 and 100 for a percentage);
             by default the scale is taken from the data.
@@ -130,6 +340,9 @@ def draw_vertical_bar_chart(
     """
     if chart_width is None:
         chart_width = len(data)
+    # The chart is chart_width columns wide: show the most recent samples (and
+    # scale to them) rather than the oldest ones.
+    data = data[-chart_width:]
 
     max_value = max(data) if y_max is None else y_max
     min_value = min(data) if y_min is None else y_min
@@ -192,8 +405,20 @@ def get_pve_subnets():
     return [item["cidr"] for item in data if "cidr" in item]
 
 
-def find_vm_ip_address():
-    """Find IP addresses of VMs based on their MAC addresses."""
+def find_vm_ip_address(guests=None):
+    """Find IP addresses of VMs based on their MAC addresses.
+
+    `guests` is the list from get_guests(); it is fetched if not given.
+    """
+    if guests is None:
+        guests = get_guests()
+    vmid_data = {
+        g["vmid"]: {
+            "type": "qemu" if g["type"] == "VM" else "lxc",
+            "node": g.get("node", NODE),
+        }
+        for g in guests
+    }
     ip_table = {}
     if SSH_HOST:
         neigh_data = ssh_execute_command(
@@ -203,12 +428,14 @@ def find_vm_ip_address():
         matches = pattern.findall(neigh_data)
         mac_to_ip = {mac.upper(): ip for ip, mac in matches}
 
-        vmid_data = get_vmids_dict()
         for vmid, info in vmid_data.items():
-            url = (
-                f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
-            )
-            config_data = get_data_from_proxapi(url)
+            try:
+                config_data = get_vm_config(
+                    vmid, "vm" if info["type"] == "qemu" else "lxc", info["node"]
+                )
+            except requests.RequestException:
+                logging.getLogger().warning("Could not read config of %s", vmid)
+                continue
             net_config = config_data.get("net0", "")
             mac_match = re.search(
                 r"(?:hwaddr=)?([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})", net_config
@@ -220,7 +447,6 @@ def find_vm_ip_address():
                     "ip": mac_to_ip.get(mac_address, "N/A"),
                 }
     else:
-        vmid_data = get_vmids_dict()
         for vmid, info in vmid_data.items():
             if info["type"] == "qemu":
                 ip_table[vmid] = {
@@ -229,8 +455,12 @@ def find_vm_ip_address():
                 }
                 continue
             # url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
-            url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/interfaces"
-            config_data = get_data_from_proxapi(url)
+            url = f"{PROXMOX_API_URL}/api2/json/nodes/{info['node']}/{info['type']}/{vmid}/interfaces"
+            try:
+                config_data = get_data_from_proxapi(url)
+            except requests.RequestException:
+                # e.g. a stopped container has no network interfaces to query
+                continue
             for data in config_data:
                 name = data.get("name", "")
                 if name != "lo":

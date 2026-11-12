@@ -45,7 +45,9 @@ SSH_USER = api
 SSH_PASSWORD = ssh-password
 ```
     
-CPU temperature and GPU usage/VRAM are read locally (Proxmon must run on the PVE host): AMD via amdgpu sysfs, NVIDIA via `nvidia-smi`. The top bar segment is hidden if no GPU is found.
+**Clusters:** by default only `NODE` is monitored. Set `NODES` to a comma-separated list (`NODES = pve1,pve2`) or `*` (every online node) to show the guests of several nodes in one table, with a `Node` column. Start/stop, stats and config use each guest's own node, the top bar shows the status of the highlighted guest's node, and a node that can't be reached is reported without hiding the others. `NODE` must be the node Proxmon runs on.
+
+CPU temperature and GPU usage/VRAM are read locally (Proxmon must run on the PVE host, so they are only shown for `NODE`): AMD via amdgpu sysfs, NVIDIA via `nvidia-smi`. The top bar segment is hidden if no GPU is found.
 
 ## Usage
 
@@ -57,6 +59,17 @@ or, when using uv:
 ```bash
 uv run python proxmon.py
 ```
+
+### Keys
+
+| Key | Action |
+|---|---|
+| Up / Down | Move between guests (the stats panel follows) |
+| `s` | Start the guest, or shut it down (asks first) |
+| `x` | Force stop (asks first) |
+| `o` / `r` | Sort by the next column / reverse the sort (or click a column header) |
+| `/` | Filter guests by name, ID, status, node, IP or MAC; Enter keeps it, Esc clears it |
+| Ctrl+Q | Quit |
 ## Demo
 
 Here is a quick demo of Proxmon in action:
@@ -67,6 +80,18 @@ https://github.com/Sr-vZ/Proxmon/raw/refs/heads/main/assets/Proxmon_Demo.mp4
 ## Contributing
 
 Contributions are welcome! Please fork the repository and submit a pull request.
+
+### Running the tests
+
+```bash
+pip install -e ".[test]"   # or: pip install pytest
+pytest
+```
+
+The tests need no Proxmox server, GPU or network. `tests/fakepve.py` is a small
+fake Proxmox API (two nodes, six guests) that replaces `requests`, and the app
+is run headless with Textual's test driver, pressing keys the way a user would.
+The full run takes about half a minute, mostly waiting for the app's timers.
 
 ## License
 

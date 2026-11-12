@@ -1,31 +1,41 @@
+import functools
 import json
 import logging
-import os
+import sys
+import threading
 import time
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 from rich.columns import Columns
 from rich.console import Group
 from rich.layout import Layout
 from rich.panel import Panel
 from rich.text import Text
+from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Container, VerticalScroll
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.widgets import Button, DataTable, Footer, Header, Input, Static
 
+from config import NODE, PROXMOX_API_URL, missing_settings
 from utils import (
     draw_vertical_bar_chart,
+    filter_guests,
     find_vm_ip_address,
     format_gpu_summary,
+    format_used_total,
     get_cpu_temperature,
     get_data_from_proxapi,
     get_gpu_stats,
+    get_guests,
+    get_nodes,
     get_vm_config,
     get_vm_data,
-    get_vmids,
+    sort_guests,
+    vm_power_action,
 )
 
 # Configure logging
@@ -37,64 +47,137 @@ formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 file_handler.setFormatter(formatter)
 logging.getLogger().addHandler(file_handler)
 
-# Load environment variables
-load_dotenv()
+# Number of samples kept for the history charts (one per 2s tick, so 10 minutes;
+# more than a chart is wide, even on a very wide terminal)
+HISTORY_SAMPLES = 300
 
-# Proxmox API configuration
-PROXMOX_API_URL = os.getenv("PROXMOX_HOST")
-API_TOKEN_ID = os.getenv("TOKEN_ID")
-API_TOKEN_SECRET = os.getenv("TOKEN_SECRET")
-NODE = os.getenv("NODE")
-SSH_HOST = os.getenv("SSH_HOST")
-SSH_PORT = int(os.getenv("SSH_PORT", 22))
-SSH_USER = os.getenv("SSH_USER")
-SSH_PASSWORD = os.getenv("SSH_PASSWORD")
-
-# Disable warnings for unverified HTTPS requests
-requests.packages.urllib3.disable_warnings(
-    requests.packages.urllib3.exceptions.InsecureRequestWarning
-)
-
-HEADERS = {"Authorization": f"PVEAPIToken={API_TOKEN_ID}={API_TOKEN_SECRET}"}
-
-# Number of samples kept for the GPU history charts
-GPU_HISTORY = 100
+# Share of the stats panel (below its 3-row header) given to the charts vs the config
+STATS_MAIN_RATIO = 2
+STATS_MISC_RATIO = 1
 
 # Global variables
-TABLE_CURSOR = dict()
 selected_vm = {
     "vmid": None,
     "type": None,
     "name": None,
     "status": None,
+    "node": None,
 }
 
+TABLE_COLUMNS = (
+    "ID",
+    "Status",
+    "Type",
+    "Name",
+    "Core",
+    "CPU (%)",
+    "RAM used/max (MB)",
+    "Disk used/max (GB)",
+    "NetIN (MB)",
+    "NetOUT (MB)",
+    "MAC",
+    "IP",
+)
 
-def toggle_vm(self):
-    """Start or stop the selected VM or LXC."""
-    global selected_vm
-    if selected_vm["vmid"] is None:
-        self.notify("Select a VM/LXC first!", severity="warning")
-        return
 
-    vmid = selected_vm["vmid"]
-    vm_type = selected_vm["type"]
-    vm_status = selected_vm["status"].split(" ")[1].lower()
-    data = get_vm_data(selected_vm["vmid"], selected_vm["type"])
-    vm_status = data["status"]
-    vm_name = selected_vm["name"]
-    guesttype = "qemu" if vm_type == "vm" else "lxc"
-    if vm_status == "running":
-        self.notify(f"{vm_name} {vm_type} Shutting down!")
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/shutdown"
-    else:
-        self.notify(f"{vm_name} {vm_type} Starting!")
-        url = (
-            f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/start"
+def coalesced(fn):
+    """Run a refresh method on one thread at a time.
+
+    A call made while a previous one is still running doesn't pile up (or get
+    dropped): it is remembered and the method runs once more as soon as the
+    current run finishes. Slow API responses therefore can't stack up requests
+    or starve the refresh.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        state = self.__dict__.setdefault(
+            f"_coalesce_{fn.__name__}",
+            {"lock": threading.Lock(), "running": False, "pending": False},
         )
-    response = requests.post(url, headers=HEADERS, verify=False)
-    response.raise_for_status()
-    return response.json()
+        with state["lock"]:
+            if state["running"]:
+                state["pending"] = True
+                return
+            state["running"] = True
+        try:
+            while True:
+                fn(self, *args, **kwargs)
+                with state["lock"]:
+                    if not state["pending"]:
+                        state["running"] = False
+                        return
+                    state["pending"] = False
+        except BaseException:
+            with state["lock"]:
+                state["running"] = False
+                state["pending"] = False
+            raise
+
+    return wrapper
+
+
+def describe_error(exc):
+    """Short, human-readable description of a refresh failure."""
+    if isinstance(exc, requests.Timeout):
+        text = "Proxmox API timed out"
+    elif isinstance(exc, requests.ConnectionError):
+        text = "Cannot reach Proxmox API"
+    elif isinstance(exc, requests.HTTPError) and exc.response is not None:
+        text = f"Proxmox API returned {exc.response.status_code} {exc.response.reason}"
+    else:
+        text = f"{type(exc).__name__}: {exc}"
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
+def guarded(fn):
+    """Report failures of a background refresh instead of letting them crash the app.
+
+    The last good data stays on screen; the app shows a notice (once, when the
+    problem starts and again when it clears) and keeps retrying on its timers.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            result = fn(self, *args, **kwargs)
+        except Exception as exc:
+            self._report_failure(fn.__name__, exc)
+        else:
+            self._report_success(fn.__name__)
+            return result
+
+    return wrapper
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """Small yes/no dialog. "No" has the focus, so Enter cancels."""
+
+    BINDINGS = [
+        ("y", "answer(True)", "Yes"),
+        ("n", "answer(False)", "No"),
+        ("escape", "answer(False)", "Cancel"),
+    ]
+
+    def __init__(self, message):
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm_box"):
+            yield Static(self.message, id="confirm_message")
+            with Horizontal(id="confirm_buttons"):
+                yield Button("Yes (y)", variant="error", id="confirm_yes")
+                yield Button("No (n)", variant="primary", id="confirm_no")
+
+    def on_mount(self):
+        self.query_one("#confirm_no", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm_yes")
+
+    def action_answer(self, answer: bool) -> None:
+        self.dismiss(answer)
 
 
 class ProxmonApp(App):
@@ -103,7 +186,12 @@ class ProxmonApp(App):
         ("", "prev_entry", "Up"),
         ("", "next_entry", "Down"),
         ("󰌑", "", "Select"),
-        ("S", "toggle_vm", "Start/Stop"),
+        ("s", "toggle_vm", "Start/Stop"),
+        ("x", "force_stop", "Force Stop"),
+        ("o", "next_sort", "Sort"),
+        ("r", "reverse_sort", "Reverse"),
+        ("/", "filter", "Filter"),
+        Binding("escape", "clear_filter", "Clear filter", show=False),
         ("Ctrl+Q", "quit", "Quit"),
     ]
 
@@ -113,6 +201,57 @@ class ProxmonApp(App):
     vm_stats = {}
     gpu_history = {}
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._failing = {}  # refresh name -> error text, while that refresh is failing
+        self._failing_lock = threading.Lock()
+        self._guests = []  # guests currently in the table, in row order
+        self._multi_node = False  # several nodes shown: add a Node column etc.
+        self.current_node = NODE  # the node whose status the top bar shows
+        self.sort_column = "ID"  # table column the guests are sorted by
+        self.sort_reverse = False
+        self.filter_text = ""
+        self._table_data = ([], {}, False)  # last fetched (guests, ip_data, multi_node)
+
+    def _report_failure(self, name, exc, label=None):
+        """Called from a worker thread when a refresh fails."""
+        text = describe_error(exc)
+        if label:
+            text = f"{label}: {text}"
+        with self._failing_lock:
+            first_for_source = name not in self._failing
+            was_healthy = not self._failing
+            self._failing[name] = text
+        if first_for_source:
+            logging.getLogger().warning("%s failed: %s", name, text, exc_info=exc)
+        if was_healthy:
+            self._ui(self.notify, f"{text}. Showing last data, retrying...", severity="error", timeout=8)
+        self._ui(self._show_status)
+
+    def _report_success(self, name):
+        """Called from a worker thread when a refresh succeeds."""
+        with self._failing_lock:
+            if name not in self._failing:
+                return
+            del self._failing[name]
+            recovered = not self._failing
+        if recovered:
+            self._ui(self.notify, "Recovered: data is live again", timeout=4)
+        self._ui(self._show_status)
+
+    def _show_status(self):
+        """Show the current problem (if any) under the title (UI thread)."""
+        with self._failing_lock:
+            problems = list(self._failing.values())
+        self.sub_title = f"⚠ {problems[0]}" if problems else ""
+
+    def _ui(self, func, *args, **kwargs):
+        """Run func on the UI thread from a worker thread (no-op if app is closing)."""
+        try:
+            self.call_from_thread(func, *args, **kwargs)
+        except RuntimeError:
+            pass
+
     def compose(self) -> ComposeResult:
         yield Header("Proxmox Monitor")
         yield Container(
@@ -120,38 +259,52 @@ class ProxmonApp(App):
             id="topbar_container",
             classes="topbar_container",
         )
+        yield Input(
+            placeholder="Filter: name, id, status, node, IP... (Enter to keep, Esc to clear)",
+            id="filter",
+        )
         yield VerticalScroll(DataTable(id="vm_table"), id="vm_table_vs")
         yield VerticalScroll(Static(id="gpu_charts"), id="gpu_charts_vs")
-        yield VerticalScroll(Static(id="stats", expand=True))
+        yield VerticalScroll(Static(id="stats", expand=True), id="stats_vs")
         yield Footer()
 
+    @work(thread=True)
+    @coalesced
+    @guarded
     def update_node_stats(self):
-        """Update and display node statistics."""
-        temp = get_cpu_temperature()
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/status"
+        """Fetch node statistics (worker thread), then display them."""
+        node = self.current_node
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/status"
         node_data = get_data_from_proxapi(url)
+        # temperature and GPU are read from this machine, so they only apply to
+        # the node Proxmon is running on
+        local = node == NODE
+        temp = get_cpu_temperature() if local else {}
+        gpus = get_gpu_stats() if local else []
+        self._ui(self.render_node_stats, temp, node_data, gpus, node)
+
+    def render_node_stats(self, temp, node_data, gpus, node=None):
+        """Display node statistics (UI thread)."""
         free_memory = node_data.get("memory").get("free", 0) / (1024 * 1024 * 1024)
         total_memory = node_data.get("memory").get("total", 0) / (1024 * 1024 * 1024)
         used_memory = round(total_memory - free_memory, 0)
-        cpu_load = (
-            float(node_data.get("loadavg")[0])
-            / int(node_data.get("cpuinfo").get("cores"))
-            * 100
-        )
+        # "cpu" is the node's current CPU utilisation as a 0-1 fraction
+        cpu_usage = float(node_data.get("cpu", 0)) * 100
         uptime = int(node_data.get("uptime", 0))
         formatted_uptime = f"{uptime // 86400:02}:{(uptime % 86400) // 3600:02}:{(uptime % 3600) // 60:02}:{uptime % 60:02}"
         # disk_free = node_data.get("rootfs").get("free") / (1024 * 1024 * 1024)
         disk_total = node_data.get("rootfs").get("total") / (1024 * 1024 * 1024)
         disk_used = node_data.get("rootfs").get("used") / (1024 * 1024 * 1024)
 
-        gpu_summary = format_gpu_summary(get_gpu_stats())
+        gpu_summary = format_gpu_summary(gpus)
         gpu_text = f"｜ {gpu_summary} " if gpu_summary else ""
+        node_text = f"｜ Node: {node} " if self._multi_node and node else ""
 
         text = (
-            f"   {node_data.get('pveversion')} "
+            f"   {node_data.get('pveversion')} {node_text}"
             f"｜   CPU: {node_data.get('cpuinfo').get('model')} "
             f"｜ 󰽘 Cores: {node_data.get('cpuinfo').get('cores')} "
-            f"｜ 󰄪 Load: {cpu_load:.0f}% "
+            f"｜ 󰄪 Usage: {cpu_usage:.0f}% "
             f"｜ 🌡️Temp: {str(temp.get('CPU', 'N/A'))} °C "
             f"{gpu_text}"
             f"｜   RAM: {used_memory:.0f}/{total_memory:.0f} GB "
@@ -160,27 +313,27 @@ class ProxmonApp(App):
         )
         self.query_one("#topbar", Static).update(Text(text, justify="full", style=""))
 
+    def _setup_columns(self, multi_node):
+        """(Re)create the table columns; several nodes get a Node column."""
+        table = self.query_one("#vm_table", DataTable)
+        columns = list(TABLE_COLUMNS)
+        if multi_node:
+            columns.insert(4, "Node")  # after Name
+        table.clear(columns=True)
+        for name in columns:
+            arrow = (" ▼" if self.sort_reverse else " ▲") if name == self.sort_column else ""
+            table.add_column(name + arrow, key=name)
+        self._multi_node = multi_node
+
     def on_mount(self):
         """Initialize the app and set up timers."""
         global selected_vm
         table = self.query_one("#vm_table", DataTable)
-        table.add_columns(
-            "ID",
-            "Status",
-            "Type",
-            "Name",
-            "Core",
-            "CPU (%)",
-            "RAM (MB)",
-            "Disk (GB)",
-            "NetIN (MB)",
-            "NetOUT (MB)",
-            "MAC",
-            "IP",
-        )
+        self._setup_columns(False)
         table.cursor_type = "row"
         table.zebra_stripes = False
         table.border = True
+        table.focus()  # not the (hidden) filter box, which would otherwise get the focus
         self.update_table()
         self.update_node_stats()
 
@@ -190,13 +343,19 @@ class ProxmonApp(App):
         self.update_gpu_charts()
         self.timer_gpu = self.set_interval(2, self.update_gpu_charts)
 
+    @work(thread=True)
+    @coalesced
+    @guarded
     def update_gpu_charts(self):
-        """Update the node-level GPU, VRAM and GTT history charts.
+        """Read the GPUs (worker thread), then update the history charts."""
+        self._ui(self.render_gpu_charts, get_gpu_stats())
+
+    def render_gpu_charts(self, gpus):
+        """Update the node-level GPU, VRAM and GTT history charts (UI thread).
 
         The panel is hidden when no supported GPU is found.
         """
         container = self.query_one("#gpu_charts_vs")
-        gpus = get_gpu_stats()
         container.display = bool(gpus)
         if not gpus:
             return
@@ -204,6 +363,8 @@ class ProxmonApp(App):
         rows = []
         for i, gpu in enumerate(gpus):
             label = f"GPU{i}" if len(gpus) > 1 else "GPU"
+            if self._multi_node:
+                label += f" ({NODE})"
             hist = self.gpu_history.setdefault(i, {"util": [], "vram": [], "gtt": []})
             samples = (
                 ("util", gpu["util"]),
@@ -212,7 +373,7 @@ class ProxmonApp(App):
             )
             for key, value in samples:
                 if value is not None:
-                    hist[key] = (hist[key] + [value])[-GPU_HISTORY:]
+                    hist[key] = (hist[key] + [value])[-HISTORY_SAMPLES:]
 
             has_gtt = bool(gpu.get("gtt_total_gb"))
             n_panels = 3 if has_gtt else 2
@@ -273,98 +434,255 @@ class ProxmonApp(App):
 
         self.query_one("#gpu_charts", Static).update(Group(*rows))
 
-    def on_key(self, event) -> None:
-        """Handle key events."""
-        if event.key == "s":
-            toggle_vm(self)
-            self.update_table()
+    def _set_sort(self, column, reverse):
+        self.sort_column, self.sort_reverse = column, reverse
+        self._draw_table(rebuild_columns=True)
 
-    def update_table(self):
-        """Update the VM and LXC table."""
-        global TABLE_CURSOR
+    def action_next_sort(self) -> None:
+        """Sort by the next column."""
+        columns = list(TABLE_COLUMNS)
+        if self._multi_node:
+            columns.insert(4, "Node")
+        index = columns.index(self.sort_column) if self.sort_column in columns else -1
+        self._set_sort(columns[(index + 1) % len(columns)], False)
+
+    def action_reverse_sort(self) -> None:
+        """Reverse the sort order."""
+        self._set_sort(self.sort_column, not self.sort_reverse)
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        """Click a column header to sort by it; click again to reverse."""
+        column = str(event.column_key.value)
+        same = column == self.sort_column
+        self._set_sort(column, not self.sort_reverse if same else False)
+
+    def action_filter(self) -> None:
+        """Show the filter box and start typing."""
+        box = self.query_one("#filter", Input)
+        box.display = True
+        box.focus()
+
+    def action_clear_filter(self) -> None:
+        """Clear the filter, hide the box and go back to the table."""
+        box = self.query_one("#filter", Input)
+        if box.display or box.value:
+            box.value = ""  # on_input_changed redraws the table
+            box.display = False
+            self.query_one("#vm_table", DataTable).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self.filter_text = event.value.strip()
+            self._draw_table()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the filter box keeps the filter and returns to the table."""
+        if event.input.id == "filter":
+            self.query_one("#vm_table", DataTable).focus()
+
+    def _highlighted_guest(self):
+        """The guest on the highlighted table row, or None."""
         table = self.query_one("#vm_table", DataTable)
+        if table.row_count and 0 <= table.cursor_row < len(self._guests):
+            return self._guests[table.cursor_row]
+        return None
 
-        # Store the current cursor position
-        selected_row = table.cursor_row
+    def _guest_label(self, guest):
+        node = f" on {guest['node']}" if self._multi_node and guest.get("node") else ""
+        return f"{guest['name']} ({guest['type']} {guest['vmid']}{node})"
 
+    def _confirm_then(self, message, action, guest):
+        def answered(yes):
+            if yes:
+                self._power(guest, action)
+
+        self.push_screen(ConfirmScreen(message), answered)
+
+    def action_toggle_vm(self) -> None:
+        """Start the highlighted guest if it is stopped, otherwise shut it down."""
+        guest = self._highlighted_guest()
+        if guest is None:
+            self.notify("Select a VM/LXC first!", severity="warning")
+        elif guest["status"] == "running":
+            self._confirm_then(
+                f"Shut down {self._guest_label(guest)}?\n(clean shutdown)",
+                "shutdown",
+                guest,
+            )
+        else:
+            self._power(guest, "start")
+
+    def action_force_stop(self) -> None:
+        """Immediately stop the highlighted guest (like pulling the power cord)."""
+        guest = self._highlighted_guest()
+        if guest is None:
+            self.notify("Select a VM/LXC first!", severity="warning")
+        elif guest["status"] != "running":
+            self.notify(f"{self._guest_label(guest)} is not running", severity="warning")
+        else:
+            self._confirm_then(
+                f"Force stop {self._guest_label(guest)}?\n"
+                "This cuts power without a clean shutdown.",
+                "stop",
+                guest,
+            )
+
+    @work(thread=True)
+    def _power(self, guest, action):
+        """Send a power action to Proxmox (worker thread)."""
+        label = self._guest_label(guest)
+        expected = "stopped" if action == "start" else "running"
+        try:
+            # the table can be up to 10s old: make sure we are acting on what the user saw
+            current = get_vm_data(guest["vmid"], guest["type"].lower(), guest.get("node"))["status"]
+            if current != expected:
+                self._ui(self.notify, f"{label} is now {current}; nothing done", severity="warning")
+                self._ui(self.update_table)
+                return
+            vm_power_action(guest["vmid"], guest["type"].lower(), action, guest.get("node"))
+        except Exception as exc:
+            self._ui(
+                self.notify,
+                f"Could not {action} {label}: {describe_error(exc)}",
+                severity="error",
+            )
+            return
+        done = {"start": "Starting", "shutdown": "Shutting down", "stop": "Stopping"}[action]
+        self._ui(self.notify, f"{done} {label}")
+        # the task runs asynchronously on the host: refresh shortly after
+        self._ui(self.set_timer, 2.0, self.update_table)
+
+    @work(thread=True)
+    @coalesced
+    @guarded
+    def update_table(self):
+        """Fetch the VM and LXC data (worker thread), then show it in the table."""
+        errors = {}
+        vm_data = get_guests(errors)
+        nodes = get_nodes()
+        ip_data = find_vm_ip_address(vm_data)
+        self._ui(self.render_table, vm_data, ip_data, len(nodes) > 1)
+        # a node that can't be reached is reported without hiding the others
+        for node in nodes:
+            if node in errors:
+                self._report_failure(f"node {node}", errors[node], label=node)
+            else:
+                self._report_success(f"node {node}")
+
+    def render_table(self, vm_data, ip_data, multi_node=False):
+        """Show the VM and LXC data in the table (UI thread)."""
+        self._table_data = (vm_data, ip_data, multi_node)
+        self._draw_table()
+
+    def _draw_table(self, rebuild_columns=False):
+        """Sort, filter and draw the last fetched data (UI thread)."""
+        all_guests, ip_data, multi_node = self._table_data
+        table = self.query_one("#vm_table", DataTable)
+        filter_box = self.query_one("#filter", Input)
+
+        if self.sort_column == "Node" and not multi_node:
+            self.sort_column, self.sort_reverse = "ID", False  # no such column now
+            rebuild_columns = True
+        vm_data = filter_guests(
+            sort_guests(all_guests, ip_data, self.sort_column, self.sort_reverse),
+            ip_data,
+            self.filter_text,
+        )
+        filter_box.border_title = (
+            f"{len(vm_data)}/{len(all_guests)} guests" if self.filter_text else ""
+        )
+
+        # Remember which guest the cursor is on, so it stays on that guest even
+        # if guests are added or removed above it
+        previous_row = table.cursor_row
+        previous_vmid = (
+            self._guests[previous_row]["vmid"]
+            if 0 <= previous_row < len(self._guests)
+            else None
+        )
+        self._guests = vm_data
+
+        if multi_node != self._multi_node:
+            self._setup_columns(multi_node)
+            self.update_node_stats()  # the top bar names the node when several are shown
+        elif rebuild_columns:
+            self._setup_columns(multi_node)
         table.clear()
 
-        vm_data = []
-        for vmid in get_vmids()["vm"]:
-            json_data = get_vm_data(vmid, type="vm")
-            json_data["type"] = "VM"
-            vm_data.append(json_data)
-
-        for vmid in get_vmids()["lxc"]:
-            json_data = get_vm_data(vmid, type="lxc")
-            json_data["type"] = "LXC"
-            vm_data.append(json_data)
-
-        vm_data = sorted(vm_data, key=lambda d: d["vmid"])
-        ip_data = find_vm_ip_address()
-
         for idx, data in enumerate(vm_data):
-            mem_usage = (
-                (data.get("maxmem", 0)) / (1024 * 1024)
-                if data.get("mem", 0) != 0
-                else 0
-            )
-            table.add_row(
+            cells = [
                 str(data["vmid"]),
                 "🟢 Running" if data["status"] == "running" else "🔴 Stopped",
                 data["type"],
                 data["name"],
-                "  " + str(data["cpus"]),
+                "  " + str(data.get("cpus", 0)),
                 str(round(data.get("cpu", 0) * 100, 2)),
-                str(round(mem_usage, 0)),
-                str(round(data.get("maxdisk", 0) / (1024 * 1024 * 1024), 0)),
-                str(round(data["netin"] / (1024 * 1024), 2)),
-                str(round(data["netout"] / (1024 * 1024), 2)),
-                ip_data.get(data["vmid"]).get("mac", "N/A"),
-                ip_data.get(data["vmid"]).get("ip", "N/A"),
-            )
+                format_used_total(data.get("mem", 0), data.get("maxmem", 0), 1024**2),
+                format_used_total(
+                    data.get("disk", 0), data.get("maxdisk", 0), 1024**3, decimals=1
+                ),
+                str(round(data.get("netin", 0) / (1024 * 1024), 2)),
+                str(round(data.get("netout", 0) / (1024 * 1024), 2)),
+                ip_data.get(data["vmid"], {}).get("mac") or "N/A",
+                ip_data.get(data["vmid"], {}).get("ip") or "N/A",
+            ]
+            if multi_node:
+                cells.insert(4, data.get("node", ""))
+            table.add_row(*cells, key=str(data["vmid"]))
 
         # Restore the cursor position
-        if selected_row is not None and selected_row < len(table.rows):
-            table.move_cursor(row=selected_row)
+        vmids = [data["vmid"] for data in vm_data]
+        if previous_vmid in vmids:
+            table.move_cursor(row=vmids.index(previous_vmid))
+        elif vm_data:
+            table.move_cursor(row=min(max(previous_row, 0), len(vm_data) - 1))
 
-        table.focus()
+        if not (filter_box.display and filter_box.has_focus):  # not while typing a filter
+            table.focus()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Handle row selection in the data table."""
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """The highlighted row is the selected VM/LXC: show its stats."""
         global selected_vm
-        global TABLE_CURSOR
-        table = self.query_one("#vm_table", DataTable)
-        row_key = event.row_key
-        row_data = table.get_row(row_key)
-
-        # selected_vm.update({
-        #     "name": row_data[3],
-        #     "vmid": row_data[0],
-        #     "type": row_data[2].lower(),
-        #     "status": row_data[1],
-        # })
-        selected_vm["name"] = row_data[3]
-        selected_vm["vmid"] = row_data[0]
-        selected_vm["type"] = row_data[2].lower()
-        selected_vm["status"] = row_data[1]
-
-        TABLE_CURSOR = {"cursor_row": event.cursor_row, "row_key": event.row_key}
-        self.update_rrd_data()
-
-    def update_rrd_data(self):
-        """Update RRD data for the selected VM or LXC."""
-        global selected_vm
-        if selected_vm["vmid"] is None:
+        if not 0 <= event.cursor_row < len(self._guests):
             return
+        guest = self._guests[event.cursor_row]
+        node = guest.get("node", NODE)
+        changed = selected_vm["vmid"] != guest["vmid"]
+        node_changed = self.current_node != node
+        self.current_node = node
+        selected_vm.update(
+            vmid=guest["vmid"],
+            type=guest["type"].lower(),
+            name=guest["name"],
+            status=guest["status"],
+            node=node,
+        )
+        if changed:
+            self.update_rrd_data()
+        if node_changed:
+            self.update_node_stats()  # the top bar follows the guest's node
 
-        vmid = selected_vm["vmid"]
-        vm_type = selected_vm["type"]
-        vm_name = selected_vm["name"]
-        # rrd_data = get_rrd_data(vmid=vmid, vm_type=vm_type)
-        # rrd_data = sorted(rrd_data, key=lambda d: d['time'])
+    @work(thread=True)
+    @coalesced
+    @guarded
+    def update_rrd_data(self):
+        """Fetch stats for the selected VM or LXC (worker thread), then show them."""
+        selected = dict(selected_vm)  # snapshot: the selection can change under us
+        if selected["vmid"] is None:
+            return
+        data = get_vm_data(selected["vmid"], selected["type"], selected["node"])
+        config = get_vm_config(selected["vmid"], selected["type"], selected["node"])
+        self._ui(self.render_rrd_data, selected, data, config)
 
-        data = get_vm_data(vmid, vm_type)
+    def render_rrd_data(self, selected, data, config):
+        """Show stats for the selected VM or LXC (UI thread)."""
+        global selected_vm
+        if selected["vmid"] != selected_vm["vmid"]:
+            return  # selection changed while fetching; the next refresh will catch up
+
+        vmid = selected["vmid"]
+        vm_type = selected["type"]
+        vm_name = selected["name"]
         ts = time.time()
         cpu = data.get("cpu", data.get("maxcpu", 0)) * 100
         mem = data.get("mem", data.get("maxmem", 0)) / (1024 * 1024)
@@ -380,23 +698,38 @@ class ProxmonApp(App):
                 "netout": [],
             }
 
-        # Update stats and keep only the last 100 values
+        # Update stats and keep only the most recent values
         self.vm_stats[vmid]["ts"].append(ts)
-        self.vm_stats[vmid]["ts"] = self.vm_stats[vmid]["ts"][-100:]
+        self.vm_stats[vmid]["ts"] = self.vm_stats[vmid]["ts"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["cpu"].append(cpu)
-        self.vm_stats[vmid]["cpu"] = self.vm_stats[vmid]["cpu"][-100:]
+        self.vm_stats[vmid]["cpu"] = self.vm_stats[vmid]["cpu"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["mem"].append(mem)
-        self.vm_stats[vmid]["mem"] = self.vm_stats[vmid]["mem"][-100:]
+        self.vm_stats[vmid]["mem"] = self.vm_stats[vmid]["mem"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["netin"].append(netin)
-        self.vm_stats[vmid]["netin"] = self.vm_stats[vmid]["netin"][-100:]
+        self.vm_stats[vmid]["netin"] = self.vm_stats[vmid]["netin"][-HISTORY_SAMPLES:]
 
         self.vm_stats[vmid]["netout"].append(netout)
-        self.vm_stats[vmid]["netout"] = self.vm_stats[vmid]["netout"][-100:]
+        self.vm_stats[vmid]["netout"] = self.vm_stats[vmid]["netout"][-HISTORY_SAMPLES:]
 
         layout = self.stats_layout()
+
+        # Fit the charts to the stats panel: two columns of two rows. Each chart
+        # needs 14 columns for its axis labels and panel border/padding, and 3
+        # rows for the panel border and the x axis.
+        stats_size = self.query_one("#stats", Static).size
+        if stats_size.height:
+            chart_width = max(10, stats_size.width // 2 - 14)
+            main_rows = (stats_size.height - 3) * STATS_MAIN_RATIO // (
+                STATS_MAIN_RATIO + STATS_MISC_RATIO
+            )
+            chart_height = max(3, min(12, main_rows // 2 - 3))
+        else:  # not laid out yet
+            chart_width, chart_height = 40, 8
+        max_mem_mb = data.get("maxmem", 0) / (1024 * 1024)
+
         vm_type_icon = "" if vm_type == "lxc" else ""
         layout["stat_header"].update(
             Panel(
@@ -412,9 +745,11 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["cpu"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="green",
+                        y_min=0,
+                        y_max=100,
                     ),
                     title="CPU Usage",
                     border_style="blue",
@@ -424,10 +759,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["mem"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="cyan",
                         decimal_places=0,
+                        y_min=0,
+                        y_max=max_mem_mb or None,
                     ),
                     title="Memory Usage",
                     border_style="blue",
@@ -437,11 +774,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["netin"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="yellow",
                         decimal_places=1,
                         char=".",
+                        y_min=0,
                     ),
                     title="Network In",
                     border_style="blue",
@@ -451,11 +789,12 @@ class ProxmonApp(App):
                 Panel(
                     draw_vertical_bar_chart(
                         self.vm_stats[vmid]["netout"],
-                        height=8,
-                        chart_width=90,
+                        height=chart_height,
+                        chart_width=chart_width,
                         color="dodger_blue2",
                         decimal_places=1,
                         char=".",
+                        y_min=0,
                     ),
                     title="Network Out",
                     border_style="blue",
@@ -475,22 +814,21 @@ class ProxmonApp(App):
                 Panel("VM/LXC Not Running!", title="Network Out", border_style="blue")
             )
 
-        self.query_one("#stats", Static).update(layout)
-        # layout["misc"].update(Panel(str(get_vm_config(vmid, vm_type)), border_style="blue"))
         layout["misc"].update(
             Panel(
-                json.dumps(get_vm_config(vmid, vm_type), indent=4, sort_keys=True),
+                json.dumps(config, indent=4, sort_keys=True),
                 border_style="magenta",
             )
         )
+        self.query_one("#stats", Static).update(layout)
 
     def stats_layout(self):
         """Define the layout for statistics display."""
         layout = self.layout
         layout.split(
             Layout(name="stat_header", size=3),
-            Layout(name="main"),
-            Layout(name="misc"),
+            Layout(name="main", ratio=STATS_MAIN_RATIO),
+            Layout(name="misc", ratio=STATS_MISC_RATIO),
         )
         layout["main"].split_column(
             Layout(name="process"),
@@ -508,5 +846,11 @@ class ProxmonApp(App):
 
 
 if __name__ == "__main__":
+    missing = missing_settings()
+    if missing:
+        sys.exit(
+            f"Missing settings: {', '.join(missing)}\n"
+            "Set them in a .env file (see .env_example) or in the environment."
+        )
     app = ProxmonApp()
     app.run()
