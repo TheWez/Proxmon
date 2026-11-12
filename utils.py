@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from config import (
     API_TIMEOUT,
     HEADERS,
     NODE,
+    NODES,
     PROXMOX_API_URL,
     SSH_HOST,
     SSH_PASSWORD,
@@ -111,17 +113,17 @@ def cached(key, ttl, loader):
     return value
 
 
-def get_vm_config(vmid, vm_type):
+def get_vm_config(vmid, vm_type, node=None):
     """Fetch vm/lxc config (cached for CONFIG_TTL seconds)"""
     if vm_type == "vm":
         guesttype = "qemu"
     else:
         guesttype = "lxc"
-    url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/config"
+    url = f"{PROXMOX_API_URL}/api2/json/nodes/{node or NODE}/{guesttype}/{vmid}/config"
     return cached(("config", url), CONFIG_TTL, lambda: get_data_from_proxapi(url))
 
 
-def vm_power_action(vmid, vm_type, action):
+def vm_power_action(vmid, vm_type, action, node=None):
     """Start, gracefully shut down, or force-stop a VM or LXC.
 
     action is "start", "shutdown" (ACPI/clean shutdown) or "stop" (immediate,
@@ -130,7 +132,7 @@ def vm_power_action(vmid, vm_type, action):
     if action not in ("start", "shutdown", "stop"):
         raise ValueError(f"unknown power action: {action}")
     guesttype = "qemu" if vm_type == "vm" else "lxc"
-    url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{guesttype}/{vmid}/status/{action}"
+    url = f"{PROXMOX_API_URL}/api2/json/nodes/{node or NODE}/{guesttype}/{vmid}/status/{action}"
     response = requests.post(url, headers=HEADERS, verify=False, timeout=API_TIMEOUT)
     response.raise_for_status()
     return response.json()["data"]
@@ -149,19 +151,69 @@ def format_used_total(used, total, divisor, decimals=0):
     return f"{fmt(used)}/{fmt(total)}"
 
 
-def get_guests():
-    """All VMs and LXCs of the node, with their current status, in two requests.
+# Seconds the list of cluster nodes is reused when NODES="*"
+NODE_DISCOVERY_TTL = 60
 
-    The list endpoints already include status, CPU, memory, disk and network
-    counters, so no per-guest status request is needed. Each entry gets a
-    "type" of "VM" or "LXC".
+
+def get_nodes():
+    """The nodes to monitor, the node Proxmon runs on first.
+
+    From the NODES setting: a comma-separated list, or "*" for every online
+    node of the cluster. Without it, just NODE.
     """
+    configured = [n.strip() for n in NODES.split(",") if n.strip()]
+    if not configured:
+        return [NODE]
+    if configured == ["*"]:
+
+        def discover():
+            data = get_data_from_proxapi(f"{PROXMOX_API_URL}/api2/json/nodes")
+            return [n["node"] for n in data if n.get("status", "online") == "online"]
+
+        configured = cached(("nodes",), NODE_DISCOVERY_TTL, discover) or [NODE]
+    return sorted(set(configured), key=lambda n: (n != NODE, n))
+
+
+def _node_guests(node):
     guests = []
     for kind, label in (("qemu", "VM"), ("lxc", "LXC")):
         for guest in get_data_from_proxapi(
-            f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{kind}"
+            f"{PROXMOX_API_URL}/api2/json/nodes/{node}/{kind}"
         ):
-            guests.append({**guest, "type": label})
+            guests.append({**guest, "type": label, "node": node})
+    return guests
+
+
+def get_guests(errors=None):
+    """All VMs and LXCs of the monitored nodes, with their current status.
+
+    Two requests per node: the list endpoints already include status, CPU,
+    memory, disk and network counters, so no per-guest status request is
+    needed. Each entry gets a "type" ("VM" or "LXC") and its "node".
+
+    With several nodes, one that can't be reached doesn't hide the others:
+    pass a dict as `errors` to have the failures collected in it ({node:
+    exception}) instead of raised. If every node fails the first error is
+    always raised.
+    """
+    nodes = get_nodes()
+    results = {}
+    failures = {}
+    if len(nodes) == 1:
+        results[nodes[0]] = _node_guests(nodes[0])
+    else:
+        with ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+            futures = {node: pool.submit(_node_guests, node) for node in nodes}
+        for node, future in futures.items():
+            try:
+                results[node] = future.result()
+            except requests.RequestException as exc:
+                failures[node] = exc
+        if failures and (errors is None or not results):
+            raise next(iter(failures.values()))
+    if errors is not None:
+        errors.update(failures)
+    guests = [g for node in nodes for g in results.get(node, [])]
     return sorted(guests, key=lambda g: g["vmid"])
 
 
@@ -175,11 +227,12 @@ def get_vmids():
     return vmids
 
 
-def get_vm_data(vmid, type="vm"):
+def get_vm_data(vmid, type="vm", node=None):
+    node = node or NODE
     if type == "vm":
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/qemu/{vmid}/status/current"
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/qemu/{vmid}/status/current"
     elif type == "lxc":
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/lxc/{vmid}/status/current"
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/lxc/{vmid}/status/current"
     else:
         return None
     return get_data_from_proxapi(url)
@@ -297,7 +350,11 @@ def find_vm_ip_address(guests=None):
     if guests is None:
         guests = get_guests()
     vmid_data = {
-        g["vmid"]: {"type": "qemu" if g["type"] == "VM" else "lxc"} for g in guests
+        g["vmid"]: {
+            "type": "qemu" if g["type"] == "VM" else "lxc",
+            "node": g.get("node", NODE),
+        }
+        for g in guests
     }
     ip_table = {}
     if SSH_HOST:
@@ -311,7 +368,7 @@ def find_vm_ip_address(guests=None):
         for vmid, info in vmid_data.items():
             try:
                 config_data = get_vm_config(
-                    vmid, "vm" if info["type"] == "qemu" else "lxc"
+                    vmid, "vm" if info["type"] == "qemu" else "lxc", info["node"]
                 )
             except requests.RequestException:
                 logging.getLogger().warning("Could not read config of %s", vmid)
@@ -335,7 +392,7 @@ def find_vm_ip_address(guests=None):
                 }
                 continue
             # url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/config"
-            url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/{info['type']}/{vmid}/interfaces"
+            url = f"{PROXMOX_API_URL}/api2/json/nodes/{info['node']}/{info['type']}/{vmid}/interfaces"
             try:
                 config_data = get_data_from_proxapi(url)
             except requests.RequestException:

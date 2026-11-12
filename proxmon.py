@@ -29,6 +29,7 @@ from utils import (
     get_data_from_proxapi,
     get_gpu_stats,
     get_guests,
+    get_nodes,
     get_vm_config,
     get_vm_data,
     vm_power_action,
@@ -57,7 +58,23 @@ selected_vm = {
     "type": None,
     "name": None,
     "status": None,
+    "node": None,
 }
+
+TABLE_COLUMNS = (
+    "ID",
+    "Status",
+    "Type",
+    "Name",
+    "Core",
+    "CPU (%)",
+    "RAM used/max (MB)",
+    "Disk used/max (GB)",
+    "NetIN (MB)",
+    "NetOUT (MB)",
+    "MAC",
+    "IP",
+)
 
 
 def coalesced(fn):
@@ -182,10 +199,14 @@ class ProxmonApp(App):
         self._failing = {}  # refresh name -> error text, while that refresh is failing
         self._failing_lock = threading.Lock()
         self._guests = []  # guests currently in the table, in row order
+        self._multi_node = False  # several nodes shown: add a Node column etc.
+        self.current_node = NODE  # the node whose status the top bar shows
 
-    def _report_failure(self, name, exc):
+    def _report_failure(self, name, exc, label=None):
         """Called from a worker thread when a refresh fails."""
         text = describe_error(exc)
+        if label:
+            text = f"{label}: {text}"
         with self._failing_lock:
             first_for_source = name not in self._failing
             was_healthy = not self._failing
@@ -237,13 +258,17 @@ class ProxmonApp(App):
     @guarded
     def update_node_stats(self):
         """Fetch node statistics (worker thread), then display them."""
-        temp = get_cpu_temperature()
-        url = f"{PROXMOX_API_URL}/api2/json/nodes/{NODE}/status"
+        node = self.current_node
+        url = f"{PROXMOX_API_URL}/api2/json/nodes/{node}/status"
         node_data = get_data_from_proxapi(url)
-        gpus = get_gpu_stats()
-        self._ui(self.render_node_stats, temp, node_data, gpus)
+        # temperature and GPU are read from this machine, so they only apply to
+        # the node Proxmon is running on
+        local = node == NODE
+        temp = get_cpu_temperature() if local else {}
+        gpus = get_gpu_stats() if local else []
+        self._ui(self.render_node_stats, temp, node_data, gpus, node)
 
-    def render_node_stats(self, temp, node_data, gpus):
+    def render_node_stats(self, temp, node_data, gpus, node=None):
         """Display node statistics (UI thread)."""
         free_memory = node_data.get("memory").get("free", 0) / (1024 * 1024 * 1024)
         total_memory = node_data.get("memory").get("total", 0) / (1024 * 1024 * 1024)
@@ -258,9 +283,10 @@ class ProxmonApp(App):
 
         gpu_summary = format_gpu_summary(gpus)
         gpu_text = f"｜ {gpu_summary} " if gpu_summary else ""
+        node_text = f"｜ Node: {node} " if self._multi_node and node else ""
 
         text = (
-            f"   {node_data.get('pveversion')} "
+            f"   {node_data.get('pveversion')} {node_text}"
             f"｜   CPU: {node_data.get('cpuinfo').get('model')} "
             f"｜ 󰽘 Cores: {node_data.get('cpuinfo').get('cores')} "
             f"｜ 󰄪 Usage: {cpu_usage:.0f}% "
@@ -272,24 +298,21 @@ class ProxmonApp(App):
         )
         self.query_one("#topbar", Static).update(Text(text, justify="full", style=""))
 
+    def _setup_columns(self, multi_node):
+        """(Re)create the table columns; several nodes get a Node column."""
+        table = self.query_one("#vm_table", DataTable)
+        columns = list(TABLE_COLUMNS)
+        if multi_node:
+            columns.insert(4, "Node")  # after Name
+        table.clear(columns=True)
+        table.add_columns(*columns)
+        self._multi_node = multi_node
+
     def on_mount(self):
         """Initialize the app and set up timers."""
         global selected_vm
         table = self.query_one("#vm_table", DataTable)
-        table.add_columns(
-            "ID",
-            "Status",
-            "Type",
-            "Name",
-            "Core",
-            "CPU (%)",
-            "RAM used/max (MB)",
-            "Disk used/max (GB)",
-            "NetIN (MB)",
-            "NetOUT (MB)",
-            "MAC",
-            "IP",
-        )
+        self._setup_columns(False)
         table.cursor_type = "row"
         table.zebra_stripes = False
         table.border = True
@@ -322,6 +345,8 @@ class ProxmonApp(App):
         rows = []
         for i, gpu in enumerate(gpus):
             label = f"GPU{i}" if len(gpus) > 1 else "GPU"
+            if self._multi_node:
+                label += f" ({NODE})"
             hist = self.gpu_history.setdefault(i, {"util": [], "vram": [], "gtt": []})
             samples = (
                 ("util", gpu["util"]),
@@ -398,9 +423,9 @@ class ProxmonApp(App):
             return self._guests[table.cursor_row]
         return None
 
-    @staticmethod
-    def _guest_label(guest):
-        return f"{guest['name']} ({guest['type']} {guest['vmid']})"
+    def _guest_label(self, guest):
+        node = f" on {guest['node']}" if self._multi_node and guest.get("node") else ""
+        return f"{guest['name']} ({guest['type']} {guest['vmid']}{node})"
 
     def _confirm_then(self, message, action, guest):
         def answered(yes):
@@ -445,12 +470,12 @@ class ProxmonApp(App):
         expected = "stopped" if action == "start" else "running"
         try:
             # the table can be up to 10s old: make sure we are acting on what the user saw
-            current = get_vm_data(guest["vmid"], guest["type"].lower())["status"]
+            current = get_vm_data(guest["vmid"], guest["type"].lower(), guest.get("node"))["status"]
             if current != expected:
                 self._ui(self.notify, f"{label} is now {current}; nothing done", severity="warning")
                 self._ui(self.update_table)
                 return
-            vm_power_action(guest["vmid"], guest["type"].lower(), action)
+            vm_power_action(guest["vmid"], guest["type"].lower(), action, guest.get("node"))
         except Exception as exc:
             self._ui(
                 self.notify,
@@ -468,11 +493,19 @@ class ProxmonApp(App):
     @guarded
     def update_table(self):
         """Fetch the VM and LXC data (worker thread), then show it in the table."""
-        vm_data = get_guests()
+        errors = {}
+        vm_data = get_guests(errors)
+        nodes = get_nodes()
         ip_data = find_vm_ip_address(vm_data)
-        self._ui(self.render_table, vm_data, ip_data)
+        self._ui(self.render_table, vm_data, ip_data, len(nodes) > 1)
+        # a node that can't be reached is reported without hiding the others
+        for node in nodes:
+            if node in errors:
+                self._report_failure(f"node {node}", errors[node], label=node)
+            else:
+                self._report_success(f"node {node}")
 
-    def render_table(self, vm_data, ip_data):
+    def render_table(self, vm_data, ip_data, multi_node=False):
         """Show the VM and LXC data in the table (UI thread)."""
         table = self.query_one("#vm_table", DataTable)
 
@@ -486,10 +519,13 @@ class ProxmonApp(App):
         )
         self._guests = vm_data
 
+        if multi_node != self._multi_node:
+            self._setup_columns(multi_node)
+            self.update_node_stats()  # the top bar names the node when several are shown
         table.clear()
 
         for idx, data in enumerate(vm_data):
-            table.add_row(
+            cells = [
                 str(data["vmid"]),
                 "🟢 Running" if data["status"] == "running" else "🔴 Stopped",
                 data["type"],
@@ -504,8 +540,10 @@ class ProxmonApp(App):
                 str(round(data.get("netout", 0) / (1024 * 1024), 2)),
                 ip_data.get(data["vmid"], {}).get("mac") or "N/A",
                 ip_data.get(data["vmid"], {}).get("ip") or "N/A",
-                key=str(data["vmid"]),
-            )
+            ]
+            if multi_node:
+                cells.insert(4, data.get("node", ""))
+            table.add_row(*cells, key=str(data["vmid"]))
 
         # Restore the cursor position
         vmids = [data["vmid"] for data in vm_data]
@@ -522,15 +560,21 @@ class ProxmonApp(App):
         if not 0 <= event.cursor_row < len(self._guests):
             return
         guest = self._guests[event.cursor_row]
+        node = guest.get("node", NODE)
         changed = selected_vm["vmid"] != guest["vmid"]
+        node_changed = self.current_node != node
+        self.current_node = node
         selected_vm.update(
             vmid=guest["vmid"],
             type=guest["type"].lower(),
             name=guest["name"],
             status=guest["status"],
+            node=node,
         )
         if changed:
             self.update_rrd_data()
+        if node_changed:
+            self.update_node_stats()  # the top bar follows the guest's node
 
     @work(thread=True)
     @coalesced
@@ -540,8 +584,8 @@ class ProxmonApp(App):
         selected = dict(selected_vm)  # snapshot: the selection can change under us
         if selected["vmid"] is None:
             return
-        data = get_vm_data(selected["vmid"], selected["type"])
-        config = get_vm_config(selected["vmid"], selected["type"])
+        data = get_vm_data(selected["vmid"], selected["type"], selected["node"])
+        config = get_vm_config(selected["vmid"], selected["type"], selected["node"])
         self._ui(self.render_rrd_data, selected, data, config)
 
     def render_rrd_data(self, selected, data, config):
